@@ -520,9 +520,26 @@ fn collect_entry_array_descriptors(
                 format!("ENTRY_ARRAY next offset does not move forward ({next} <= {current})"),
             ));
         }
+        let first_unused =
+            if file.inner.header.state != STATE_ONLINE && used_items < layout.item_count {
+                Some(read_entry_array_item(file, current, &layout, used_items)?)
+            } else {
+                None
+            };
+        if remaining == 0
+            && !allow_online_snapshot_truncate
+            && start == file.inner.header.entry_array_offset
+            && expected_items == file.inner.header.n_entries
+            && file.confirms_appended_boundary(
+                first_unused.filter(|offset| *offset != 0),
+                (next != 0).then_some(next),
+                layout.item_count - used_items,
+            )
+        {
+            break;
+        }
         if file.inner.header.state != STATE_ONLINE && used_items < layout.item_count {
-            let first_unused = read_entry_array_item(file, current, &layout, used_items)?;
-            if first_unused != 0 {
+            if first_unused != Some(0) {
                 return Err(file.metadata_error(
                     Some(current),
                     "ENTRY_ARRAY unused tail starts with a non-zero offset",

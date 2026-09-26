@@ -15,6 +15,8 @@ use crate::reader::MmapAccess;
 use crate::reader::{ByteBuf, FileAccess, ReopenAccess};
 use crate::util::checked_add_u64;
 use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -45,6 +47,8 @@ struct JournalFileInner {
     used_size: u64,
     file_len: u64,
     modified_at_open: Option<SystemTime>,
+    #[cfg(unix)]
+    file_identity: (u64, u64),
     access: Access,
 }
 
@@ -74,6 +78,8 @@ impl JournalFile {
                 used_size: self.inner.used_size,
                 file_len: self.inner.file_len,
                 modified_at_open: self.inner.modified_at_open,
+                #[cfg(unix)]
+                file_identity: self.inner.file_identity,
                 access: Access::Reopen(ReopenAccess::new(
                     self.inner.path.clone(),
                     self.inner.header.file_id,
@@ -235,6 +241,8 @@ impl JournalFile {
                 used_size,
                 file_len,
                 modified_at_open,
+                #[cfg(unix)]
+                file_identity: (opening_metadata.dev(), opening_metadata.ino()),
                 access,
             }),
         })
@@ -498,6 +506,158 @@ impl JournalFile {
                 reason,
             }
         }
+    }
+
+    // Only the file-level frozen boundary may use this exception. The caller
+    // already validated every offset inside that boundary. This does not refresh
+    // the snapshot, trust the appended payloads, or validate all appended entries.
+    pub(super) fn confirms_appended_boundary(
+        &self,
+        first_unused: Option<u64>,
+        next_array: Option<u64>,
+        spare_slots: usize,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            self.check_appended_boundary(first_unused, next_array, spare_slots)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            // No portable same-file identity proof is available here. Preserve
+            // the original strict validation instead of weakening that guard.
+            let _ = (first_unused, next_array, spare_slots);
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_appended_boundary(
+        &self,
+        first_unused: Option<u64>,
+        next_array: Option<u64>,
+        spare_slots: usize,
+    ) -> Result<bool> {
+        let old = &self.inner.header;
+        if old.state != crate::format::STATE_OFFLINE
+            || (first_unused.is_none() && next_array.is_none())
+            || (spare_slots != 0 && first_unused.is_none())
+        {
+            return Ok(false);
+        }
+        // One temporary fd, two <=272-byte header reads and at most three
+        // 16-byte object headers. No scan, remap, retained fd, retry or cache.
+        // Two equal observations are not an atomic snapshot of a live writer.
+        let file =
+            Arc::new(File::open(&self.inner.path).map_err(|error| {
+                SdJournalError::io("open", Some(self.inner.path.clone()), error)
+            })?);
+        let before = file.metadata().map_err(|error| {
+            SdJournalError::io("metadata", Some(self.inner.path.clone()), error)
+        })?;
+        if (before.dev(), before.ino()) != self.inner.file_identity
+            || before.len() < self.inner.file_len
+        {
+            return Ok(false);
+        }
+        let access = FileAccess::new(self.inner.path.clone(), Arc::clone(&file));
+        let header_len = old.header_size.min(272) as usize;
+        let first = access.read_known_valid(0, header_len)?;
+        let fresh = Header::parse(first.as_slice(), &self.inner.path)?;
+        if fresh.state > crate::format::STATE_ONLINE
+            || fresh.file_id != old.file_id
+            || fresh.seqnum_id != old.seqnum_id
+            || fresh.machine_id != old.machine_id
+            || fresh.boot_id != old.boot_id
+            || fresh.header_size != old.header_size
+            || fresh.compatible_flags != old.compatible_flags
+            || fresh.incompatible_flags != old.incompatible_flags
+            || fresh.entry_array_offset != old.entry_array_offset
+            || fresh.head_entry_seqnum != old.head_entry_seqnum
+            || fresh.head_entry_realtime != old.head_entry_realtime
+            || fresh.arena_size < old.arena_size
+            || fresh.n_entries <= old.n_entries
+            || fresh.tail_object_offset < self.inner.used_size
+            || fresh.tail_entry_seqnum <= old.tail_entry_seqnum
+        {
+            return Ok(false);
+        }
+        if next_array.is_some() && fresh.n_entries - old.n_entries <= spare_slots as u64 {
+            return Ok(false);
+        }
+        let Some(sequence_growth) = fresh
+            .tail_entry_seqnum
+            .zip(old.tail_entry_seqnum)
+            .and_then(|(new, old)| new.checked_sub(old))
+        else {
+            return Ok(false);
+        };
+        if sequence_growth < fresh.n_entries - old.n_entries {
+            return Ok(false);
+        }
+        let Some(arena_end) = fresh.header_size.checked_add(fresh.arena_size) else {
+            return Ok(false);
+        };
+        if arena_end > before.len() {
+            return Ok(false);
+        }
+        let read_header = |offset: u64| -> Result<Option<(ObjectHeader, u64)>> {
+            if offset < self.inner.used_size
+                || !offset.is_multiple_of(8)
+                || offset > fresh.tail_object_offset
+                || offset.checked_add(16).is_none_or(|end| end > arena_end)
+            {
+                return Ok(None);
+            }
+            let bytes = access.read_known_valid(offset, 16)?;
+            let object = ObjectHeader::parse(bytes.as_slice(), &self.inner.path, offset)?;
+            let end = offset
+                .checked_add(object.size)
+                .and_then(|end| end.checked_add(7))
+                .map(|end| end & !7);
+            let Some(end) = end else {
+                return Ok(None);
+            };
+            if object.size < 16
+                || object.size > self.inner.config.max_object_size_bytes
+                || end > arena_end
+            {
+                return Ok(None);
+            }
+            Ok(Some((object, end)))
+        };
+        let Some((tail, committed_end)) = read_header(fresh.tail_object_offset)? else {
+            return Ok(false);
+        };
+        if !(1..=7).contains(&tail.object_type) {
+            return Ok(false);
+        }
+        for (offset, kind, minimum) in [
+            (first_unused, crate::format::OBJECT_ENTRY, 64),
+            (
+                next_array,
+                crate::format::OBJECT_ENTRY_ARRAY,
+                if old.is_compact() { 28 } else { 32 },
+            ),
+        ] {
+            if let Some(offset) = offset {
+                let Some((object, end)) = read_header(offset)? else {
+                    return Ok(false);
+                };
+                if object.object_type != kind
+                    || object.flags != 0
+                    || object.size < minimum
+                    || end > committed_end
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        let second = access.read_known_valid(0, header_len)?;
+        let after = file.metadata().map_err(|error| {
+            SdJournalError::io("metadata", Some(self.inner.path.clone()), error)
+        })?;
+        Ok(first.as_slice() == second.as_slice() && before.len() == after.len())
     }
 
     fn validate_entry_index_metadata(&self) -> Result<()> {
