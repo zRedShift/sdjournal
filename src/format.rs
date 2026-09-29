@@ -648,4 +648,24 @@ mod tests {
             other => panic!("unexpected result: {other:?}"),
         }
     }
+
+    #[test]
+    fn entry_items_validate_later_offsets_before_yielding_and_keep_limit_precedence() {
+        for (compact, width) in [(true, 4), (false, 16)] {
+            let mut bytes = vec![0; width * 3];
+            bytes[0] = 100;
+            bytes[width] = 200;
+            match parse_entry_data_offsets_bytes(&bytes, compact, 3, Path::new("dummy"), 9) {
+                Err(SdJournalError::Corrupt { reason, offset, .. }) => {
+                    assert_eq!(reason, "ENTRY item has zero object offset");
+                    assert_eq!(offset, Some(9 + 64 + (2 * width) as u64));
+                }
+                other => panic!("later invalid item accepted: {other:?}"),
+            }
+            assert!(matches!(
+                parse_entry_data_offsets_bytes(&bytes, compact, 2, Path::new("dummy"), 9),
+                Err(SdJournalError::LimitExceeded { kind: LimitKind::FieldsPerEntry, limit: 2 })
+            ));
+        }
+    }
 }

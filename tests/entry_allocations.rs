@@ -56,6 +56,7 @@ static ALLOCATOR: CountedSystem = CountedSystem;
 fn mmap_entry_walk_uses_one_metadata_allocation_without_regrowth() {
     let units = vec!["alpha.service"; 64];
     let fixture = SyntheticJournalFile::new(&units);
+    fixture.rewrite(&units);
     // The synthetic builder creates an online file. This fixture is finished
     // before opening, so mark it OFFLINE to exercise the real stable mmap path.
     let mut file = std::fs::OpenOptions::new().write(true)
