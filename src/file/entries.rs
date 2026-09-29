@@ -54,7 +54,7 @@ impl JournalFile {
             entry_offset,
         )?;
 
-        let mut fields_in_order = Vec::new();
+        let mut fields_in_order = Vec::with_capacity(data_offsets.len());
         let mut total_payload_bytes = 0u64;
         for data_offset in data_offsets {
             let payload = self.read_data_payload_bytes_for_object(data_offset)?;

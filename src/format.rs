@@ -279,13 +279,49 @@ impl ObjectHeader {
     }
 }
 
-pub(crate) fn parse_entry_data_offsets_bytes(
-    items_bytes: &[u8],
+#[derive(Debug, Clone)]
+pub(crate) enum EntryDataOffsets<'a> {
+    Compact(std::slice::Iter<'a, [u8; 4]>),
+    Regular(std::slice::Iter<'a, [u8; 16]>),
+}
+
+impl Iterator for EntryDataOffsets<'_> {
+    type Item = FileOffset;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Compact(items) => items
+                .next()
+                .map(|bytes| u64::from(u32::from_le_bytes(*bytes))),
+            Self::Regular(items) => items
+                .next()
+                .map(|&[a, b, c, d, e, f, g, h, ..]| u64::from_le_bytes([a, b, c, d, e, f, g, h])),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len(), Some(self.len()))
+    }
+}
+
+impl ExactSizeIterator for EntryDataOffsets<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Compact(items) => items.len(),
+            Self::Regular(items) => items.len(),
+        }
+    }
+}
+
+impl std::iter::FusedIterator for EntryDataOffsets<'_> {}
+
+pub(crate) fn parse_entry_data_offsets_bytes<'a>(
+    items_bytes: &'a [u8],
     compact: bool,
     max_fields_per_entry: usize,
     path: &Path,
     entry_offset: FileOffset,
-) -> Result<Vec<FileOffset>> {
+) -> Result<EntryDataOffsets<'a>> {
     if items_bytes.is_empty() {
         return Err(SdJournalError::Corrupt {
             path: Some(path.to_path_buf()),
@@ -294,7 +330,6 @@ pub(crate) fn parse_entry_data_offsets_bytes(
         });
     }
 
-    let mut data_offsets = Vec::new();
     if compact {
         // In compact format, each ENTRY item is 4 bytes:
         // - object_offset: u32
@@ -326,7 +361,6 @@ pub(crate) fn parse_entry_data_offsets_bytes(
                     reason: "ENTRY item has zero object offset".to_string(),
                 });
             }
-            data_offsets.push(u64::from(off));
             i += 4;
         }
     } else {
@@ -361,12 +395,18 @@ pub(crate) fn parse_entry_data_offsets_bytes(
                     reason: "ENTRY item has zero object offset".to_string(),
                 });
             }
-            data_offsets.push(object_offset);
             i += 16;
         }
     }
 
-    Ok(data_offsets)
+    // All offsets are checked before returning, preserving error order relative
+    // to later DATA reads. Borrow the validated item area instead of allocating
+    // a temporary offsets Vec for every entry.
+    Ok(if compact {
+        EntryDataOffsets::Compact(items_bytes.as_chunks::<4>().0.iter())
+    } else {
+        EntryDataOffsets::Regular(items_bytes.as_chunks::<16>().0.iter())
+    })
 }
 
 pub(crate) fn compression_from_object_flags(flags: u8) -> Result<Option<CompressionAlgo>> {
@@ -583,7 +623,8 @@ mod tests {
 
         let got = parse_entry_data_offsets_bytes(&items, true, 1024, Path::new("dummy"), 0)
             .expect("parse compact entry items");
-        assert_eq!(got, vec![100, 200]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.collect::<Vec<_>>(), vec![100, 200]);
     }
 
     #[test]
@@ -598,7 +639,11 @@ mod tests {
 
         let got = parse_entry_data_offsets_bytes(&items, false, 1024, Path::new("dummy"), 0)
             .expect("parse regular entry items");
-        assert_eq!(got, vec![0x1111_2222_3333_4444, 0x5555_6666_7777_8888]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.collect::<Vec<_>>(),
+            vec![0x1111_2222_3333_4444, 0x5555_6666_7777_8888]
+        );
     }
 
     #[test]
@@ -664,7 +709,10 @@ mod tests {
             }
             assert!(matches!(
                 parse_entry_data_offsets_bytes(&bytes, compact, 2, Path::new("dummy"), 9),
-                Err(SdJournalError::LimitExceeded { kind: LimitKind::FieldsPerEntry, limit: 2 })
+                Err(SdJournalError::LimitExceeded {
+                    kind: LimitKind::FieldsPerEntry,
+                    limit: 2
+                })
             ));
         }
     }

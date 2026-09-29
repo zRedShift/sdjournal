@@ -19,8 +19,10 @@ struct CountedSystem;
 fn record(reallocation: bool) {
     let _ = COUNT.try_with(|count| {
         if let Some((allocations, reallocations)) = count.get() {
-            count.set(Some((allocations.saturating_add(usize::from(!reallocation)),
-                            reallocations.saturating_add(usize::from(reallocation)))));
+            count.set(Some((
+                allocations.saturating_add(usize::from(!reallocation)),
+                reallocations.saturating_add(usize::from(reallocation)),
+            )));
         }
     });
 }
@@ -59,8 +61,10 @@ fn mmap_entry_walk_uses_one_metadata_allocation_without_regrowth() {
     fixture.rewrite(&units);
     // The synthetic builder creates an online file. This fixture is finished
     // before opening, so mark it OFFLINE to exercise the real stable mmap path.
-    let mut file = std::fs::OpenOptions::new().write(true)
-        .open(fixture.root().join("synthetic.journal")).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.root().join("synthetic.journal"))
+        .unwrap();
     file.seek(SeekFrom::Start(16)).unwrap();
     file.write_all(&[0]).unwrap();
     drop(file);
@@ -72,8 +76,15 @@ fn mmap_entry_walk_uses_one_metadata_allocation_without_regrowth() {
         let item = entries.next();
         let observed = COUNT.with(|count| count.replace(None).unwrap());
         let entry = item.unwrap().unwrap();
-        assert_eq!(observed, (1, 0), "entry {index} metadata allocation/reallocation");
-        assert_eq!(entry.get("MESSAGE").unwrap(), synthetic_message(7, index, unit).as_bytes());
+        assert_eq!(
+            observed,
+            (1, 0),
+            "entry {index} metadata allocation/reallocation"
+        );
+        assert_eq!(
+            entry.get("MESSAGE").unwrap(),
+            synthetic_message(7, index, unit).as_bytes()
+        );
         assert_eq!(entry.iter_fields().count(), 6);
         held.push(entry);
     }
@@ -82,8 +93,14 @@ fn mmap_entry_walk_uses_one_metadata_allocation_without_regrowth() {
     drop(entries);
     drop(journal);
     for (index, entry) in held.iter().enumerate() {
-        assert_eq!(entry.get("MESSAGE").unwrap(), synthetic_message(7, index, units[index]).as_bytes());
+        assert_eq!(
+            entry.get("MESSAGE").unwrap(),
+            synthetic_message(7, index, units[index]).as_bytes()
+        );
     }
     drop(held);
-    assert_eq!(clone.get("MESSAGE").unwrap(), synthetic_message(7, 0, units[0]).as_bytes());
+    assert_eq!(
+        clone.get("MESSAGE").unwrap(),
+        synthetic_message(7, 0, units[0]).as_bytes()
+    );
 }
