@@ -12,6 +12,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(test)]
+thread_local! {
+    static VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct ReaderCache {
     config: JournalConfig,
     entries: Mutex<VecDeque<CachedReader>>,
@@ -146,6 +151,8 @@ impl CachedReader {
         file_id: [u8; 16],
         seqnum_id: [u8; 16],
     ) -> Result<(u8, u64)> {
+        #[cfg(test)]
+        VALIDATIONS.with(|count| count.set(count.get() + 1));
         use std::os::unix::fs::MetadataExt as _;
         let metadata = std::fs::metadata(path).map_err(|error| open_error(path, error))?;
         if (metadata.dev(), metadata.ino()) != self.identity
@@ -316,6 +323,32 @@ mod tests {
                 .map(|(k, v)| (k.to_owned(), v.to_vec()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn cached_entry_validates_at_entry_boundaries_not_per_field() {
+        let (_root, paths) = files(65);
+        for budget in [1, 2] {
+            let config = JournalConfig {
+                max_open_files: budget,
+                ..Default::default()
+            };
+            let cache = ReaderCache::new(&config);
+            let file = open(&cache, &paths[0]);
+            let offset = file.inner.header.tail_entry_offset.unwrap();
+            let reference = JournalFile::open(paths[0].clone(), &config)
+                .unwrap()
+                .read_entry_ref(offset)
+                .unwrap();
+            assert_eq!(reference.iter_fields().count(), 6);
+            // Warm setup is excluded: count only the actual entry decode boundary.
+            file.read_entry_ref(offset).unwrap();
+            VALIDATIONS.with(|count| count.set(0));
+            let actual = file.read_entry_ref(offset).unwrap();
+            assert_eq!(snapshot(actual), snapshot(reference));
+            let validations = VALIDATIONS.with(std::cell::Cell::get);
+            assert_eq!(validations, 2, "warm six-field entry validation count");
+        }
     }
 
     #[test]
