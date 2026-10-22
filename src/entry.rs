@@ -176,6 +176,17 @@ pub struct EntryRef {
 }
 
 impl EntryRef {
+    /// Cached entry transactions must not lend their map beyond the cache lock.
+    #[cfg(unix)]
+    pub(crate) fn into_owned_payloads(mut self) -> Self {
+        for field in &mut self.fields_in_order {
+            if !matches!(field.payload, ByteBuf::Owned(_)) {
+                field.payload = ByteBuf::from_vec(field.payload.as_slice().to_vec());
+            }
+        }
+        self
+    }
+
     pub(crate) fn new_parsed(
         key: SdJournalEntryKey,
         fields_in_order: Vec<(ByteBuf, usize)>,
@@ -271,6 +282,69 @@ impl EntryRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "mmap"))]
+    #[test]
+    fn cached_payload_conversion_releases_map_and_preserves_binary_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("payload");
+        let bytes = b"MESSAGE=\0\xffMESSAGE=second";
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // Test fixture is immutable for the map lifetime.
+        let map = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file) }.unwrap());
+        let weak = Arc::downgrade(&map);
+        let entry = EntryRef::new_parsed(
+            SdJournalEntryKey {
+                file_id: [1; 16],
+                entry_offset: 8,
+                seqnum_id: [2; 16],
+                seqnum: 3,
+                realtime_usec: 4,
+                monotonic_usec: 5,
+                boot_id: [6; 16],
+                xor_hash: 7,
+            },
+            vec![
+                (
+                    ByteBuf::from_mmap(Arc::clone(&map), 0..10, &path).unwrap(),
+                    7,
+                ),
+                (
+                    ByteBuf::from_mmap(Arc::clone(&map), 10..bytes.len(), &path).unwrap(),
+                    7,
+                ),
+                (ByteBuf::from_vec(b"OTHER=owned".to_vec()), 5),
+            ],
+        );
+        let key = entry.entry_key();
+        let owned_arc = match &entry.fields_in_order[2].payload {
+            ByteBuf::Owned(value) => Arc::downgrade(value),
+            _ => unreachable!(),
+        };
+        drop(map);
+        let converted = entry.into_owned_payloads();
+        assert!(weak.upgrade().is_none());
+        assert!(
+            owned_arc.upgrade().is_some(),
+            "already-owned allocation is reused"
+        );
+        assert_eq!(converted.entry_key(), key);
+        assert_eq!(
+            converted.iter_fields().collect::<Vec<_>>(),
+            vec![
+                ("MESSAGE", &b"\0\xff"[..]),
+                ("MESSAGE", &b"second"[..]),
+                ("OTHER", &b"owned"[..]),
+            ]
+        );
+        assert!(
+            converted
+                .fields_in_order
+                .iter()
+                .all(|f| matches!(f.payload, ByteBuf::Owned(_)))
+        );
+    }
 
     #[test]
     fn entry_owned_get_prefers_first_duplicate_and_iter_preserves_order() {

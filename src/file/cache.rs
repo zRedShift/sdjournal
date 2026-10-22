@@ -15,6 +15,7 @@ use std::{
 #[cfg(test)]
 thread_local! {
     static VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ENTRY_END_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) struct ReaderCache {
@@ -202,6 +203,23 @@ impl CachedReader {
             self.access = Access::File(FileAccess::new(self.path.clone(), Arc::clone(&self.file)));
             return Err(transient(&self.path, "file was truncated while reading"));
         }
+        self.prepare_access(state, file_len, config)?;
+        let bytes = match &self.access {
+            Access::File(reader) => reader.read_known_valid(offset, len)?,
+            #[cfg(feature = "mmap")]
+            Access::Mmap(reader) => reader.read_known_valid(offset, len)?,
+            _ => return Err(transient(&self.path, "invalid cached reader access")),
+        };
+        // Old lazy reads were owned. Preserve that boundary: no map/FD can
+        // escape the bounded cache through a retained EntryRef/ByteBuf.
+        match bytes {
+            ByteBuf::Owned(_) => Ok(bytes),
+            #[cfg(feature = "mmap")]
+            ByteBuf::Mmap { .. } => Ok(ByteBuf::from_vec(bytes.as_slice().to_vec())),
+        }
+    }
+
+    fn prepare_access(&mut self, state: u8, file_len: u64, config: &JournalConfig) -> Result<()> {
         #[cfg(feature = "mmap")]
         {
             let allow_map = matches!(config.mmap_policy, crate::config::MmapPolicy::Auto)
@@ -226,24 +244,76 @@ impl CachedReader {
             }
         }
         #[cfg(not(feature = "mmap"))]
-        let _ = (state, config);
-        let bytes = match &self.access {
-            Access::File(reader) => reader.read_known_valid(offset, len)?,
-            #[cfg(feature = "mmap")]
-            Access::Mmap(reader) => reader.read_known_valid(offset, len)?,
-            _ => return Err(transient(&self.path, "invalid cached reader access")),
-        };
-        // Old lazy reads were owned. Preserve that boundary: no map/FD can
-        // escape the bounded cache through a retained EntryRef/ByteBuf.
-        match bytes {
-            ByteBuf::Owned(_) => Ok(bytes),
-            #[cfg(feature = "mmap")]
-            ByteBuf::Mmap { .. } => Ok(ByteBuf::from_vec(bytes.as_slice().to_vec())),
-        }
+        let _ = (state, file_len, config);
+        Ok(())
     }
 }
 
 impl CachedAccess {
+    pub(super) fn read_entry(
+        &self,
+        snapshot: &JournalFile,
+        offset: u64,
+    ) -> Result<crate::EntryRef> {
+        let mut entries = self
+            .cache
+            .entries
+            .lock()
+            .map_err(|_| transient(&self.path, "journal reader cache lock poisoned"))?;
+        let mut reader =
+            if let Some(index) = entries.iter().rposition(|entry| entry.path == self.path) {
+                entries
+                    .remove(index)
+                    .ok_or_else(|| transient(&self.path, "journal reader cache slot disappeared"))?
+            } else {
+                if entries.len() == self.cache.config.max_open_files {
+                    drop(entries.pop_front());
+                }
+                CachedReader::open(self.path.clone(), &self.cache.config)?
+            };
+        let result = (|| {
+            let (state, file_len) = reader.validate(
+                &self.path,
+                Some(self.identity),
+                self.file_id,
+                self.seqnum_id,
+            )?;
+            // Refuse before touching a stale map, with the existing truncation kind.
+            if file_len < snapshot.inner.used_size {
+                return Err(transient(&self.path, "file was truncated while reading"));
+            }
+            reader.prepare_access(state, file_len, &self.cache.config)?;
+            let decoded = {
+                let direct = snapshot.with_direct_access(reader.access.clone());
+                direct
+                    .read_entry_ref_inner(offset)
+                    .map(crate::EntryRef::into_owned_payloads)
+            }; // All temporary map/FD aliases die while the cache remains locked.
+            #[cfg(test)]
+            ENTRY_END_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
+            // Preserve the primary decoder/read error instead of masking it.
+            let entry = decoded?;
+            let (final_state, final_len) = reader.validate(
+                &self.path,
+                Some(self.identity),
+                self.file_id,
+                self.seqnum_id,
+            )?;
+            if final_state != state || final_len < file_len {
+                return Err(transient(&self.path, "journal changed during entry read"));
+            }
+            Ok(entry)
+        })();
+        if result.is_ok() {
+            entries.push_back(reader);
+        }
+        result
+    }
+
     pub(super) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
         let mut entries = self
             .cache
@@ -349,6 +419,239 @@ mod tests {
             let validations = VALIDATIONS.with(std::cell::Cell::get);
             assert_eq!(validations, 2, "warm six-field entry validation count");
         }
+    }
+
+    #[test]
+    fn cached_entry_end_drift_refuses_and_retires_only_selected_reader() {
+        for fault in 0..6 {
+            let (_root, paths) = files(2);
+            let cache = ReaderCache::new(&JournalConfig::default());
+            let victim = open(&cache, &paths[0]);
+            let healthy = open(&cache, &paths[1]);
+            let offset = victim.inner.header.tail_entry_offset.unwrap();
+            let path = paths[0].clone();
+            ENTRY_END_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || match fault {
+                    0 => {
+                        let replacement = path.with_extension("new");
+                        std::fs::copy(&path, &replacement).unwrap();
+                        std::fs::rename(replacement, path).unwrap();
+                    }
+                    1 => patch(&path, 24, &[99; 16]),
+                    2 => std::fs::remove_file(path).unwrap(),
+                    3 => {
+                        let len = std::fs::metadata(&path).unwrap().len();
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(path)
+                            .unwrap()
+                            .set_len(len - 1)
+                            .unwrap();
+                    }
+                    4 => patch(&path, 16, &[crate::format::STATE_ONLINE]),
+                    _ => patch(&path, 16, &[crate::format::STATE_ARCHIVED]),
+                }))
+            });
+            assert!(victim.read_entry_ref(offset).is_err(), "fault {fault}");
+            assert_eq!(cache.entries.lock().unwrap().len(), 1);
+            assert!(
+                healthy
+                    .read_entry_ref(healthy.inner.header.tail_entry_offset.unwrap())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn cached_entry_online_start_and_append_keep_original_snapshot() {
+        let (_root, paths) = files(1);
+        let cache = ReaderCache::new(&JournalConfig::default());
+        let old = open(&cache, &paths[0]);
+        let offset = old.inner.header.tail_entry_offset.unwrap();
+        let expected = snapshot(old.read_entry_ref(offset).unwrap());
+        patch(&paths[0], 16, &[crate::format::STATE_ONLINE]);
+        let path = paths[0].clone();
+        ENTRY_END_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let len = std::fs::metadata(&path).unwrap().len();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(len + 4096)
+                    .unwrap();
+            }))
+        });
+        assert_eq!(snapshot(old.read_entry_ref(offset).unwrap()), expected);
+        assert!(matches!(
+            cache.entries.lock().unwrap()[0].access,
+            Access::File(_)
+        ));
+        patch(&paths[0], 16, &[crate::format::STATE_ARCHIVED]);
+        assert_eq!(snapshot(old.read_entry_ref(offset).unwrap()), expected);
+        #[cfg(feature = "mmap")]
+        assert!(matches!(
+            cache.entries.lock().unwrap()[0].access,
+            Access::Mmap(_)
+        ));
+        // New larger snapshot cannot enlarge an old entry's DATA object bounds.
+        fixture::write_synthetic_journal_file(&paths[0], &["a.service"; 30], 1);
+        let newer = open(&cache, &paths[0]);
+        assert!(newer.inner.used_size > old.inner.used_size);
+        let beyond_old = newer.inner.header.tail_entry_offset.unwrap();
+        assert!(newer.read_entry_ref(beyond_old).is_ok());
+        assert!(matches!(
+            old.read_entry_ref(beyond_old),
+            Err(SdJournalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn cached_entry_truncated_prefix_refuses_before_map_and_parse_error_stays_primary() {
+        let (_root, paths) = files(1);
+        let cache = ReaderCache::new(&JournalConfig::default());
+        let file = open(&cache, &paths[0]);
+        let offset = file.inner.header.tail_entry_offset.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[0])
+            .unwrap()
+            .set_len(file.inner.used_size - 1)
+            .unwrap();
+        VALIDATIONS.with(|count| count.set(0));
+        assert!(matches!(
+            file.read_entry_ref(offset),
+            Err(SdJournalError::Transient { .. })
+        ));
+        assert_eq!(VALIDATIONS.with(std::cell::Cell::get), 1);
+        assert!(cache.entries.lock().unwrap().is_empty());
+
+        fixture::write_synthetic_journal_file(&paths[0], &["a.service"; 3], 1);
+        let file = open(&cache, &paths[0]);
+        let offset = file.inner.header.tail_entry_offset.unwrap();
+        patch(&paths[0], offset, &[crate::format::OBJECT_DATA]);
+        let path = paths[0].clone();
+        ENTRY_END_HOOK
+            .with(|slot| *slot.borrow_mut() = Some(Box::new(move || patch(&path, 16, &[255]))));
+        VALIDATIONS.with(|count| count.set(0));
+        match file.read_entry_ref(offset) {
+            Err(SdJournalError::Corrupt { reason, .. }) => {
+                assert!(reason.contains("expected ENTRY"))
+            }
+            other => panic!("expected primary ENTRY parse error, got {other:?}"),
+        }
+        assert_eq!(
+            VALIDATIONS.with(std::cell::Cell::get),
+            1,
+            "no post-parse error masking"
+        );
+        assert!(cache.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_entry_keeps_field_limit_error_and_poison_kind() {
+        let (_root, paths) = files(1);
+        let cache = ReaderCache::new(&JournalConfig {
+            max_fields_per_entry: 5,
+            ..Default::default()
+        });
+        let file = open(&cache, &paths[0]);
+        let offset = file.inner.header.tail_entry_offset.unwrap();
+        assert!(matches!(
+            file.read_entry_ref(offset),
+            Err(SdJournalError::LimitExceeded {
+                kind: crate::error::LimitKind::FieldsPerEntry,
+                ..
+            })
+        ));
+        assert!(cache.entries.lock().unwrap().is_empty());
+        let other = Arc::clone(&cache);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = other.entries.lock().unwrap();
+                panic!("test-only poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            file.read_entry_ref(offset),
+            Err(SdJournalError::Transient { .. })
+        ));
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn cached_entry_compressed_payload_and_limits_match_eager() {
+        let (_root, paths) = files(1);
+        let bytes = std::fs::read(&paths[0]).unwrap();
+        let offset = u64::from_le_bytes(bytes[264..272].try_into().unwrap());
+        let item = offset as usize + 64 + 3 * 16; // MESSAGE DATA object.
+        let data = u64::from_le_bytes(bytes[item..item + 8].try_into().unwrap());
+        let payload = [b"MESSAGE=".as_slice(), &[b'x'; 1024]].concat();
+        let mut packed = (payload.len() as u64).to_le_bytes().to_vec();
+        packed.extend(lz4_flex::block::compress(&payload));
+        let original_size = u64::from_le_bytes(
+            bytes[data as usize + 8..data as usize + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(packed.len() as u64 <= original_size - 64);
+        patch(
+            &paths[0],
+            12,
+            &crate::format::HEADER_INCOMPATIBLE_COMPRESSED_LZ4.to_le_bytes(),
+        );
+        patch(&paths[0], data + 1, &[crate::format::OBJECT_COMPRESSED_LZ4]);
+        patch(
+            &paths[0],
+            data + 8,
+            &(64 + packed.len() as u64).to_le_bytes(),
+        );
+        patch(&paths[0], data + 64, &packed);
+        let config = JournalConfig::default();
+        let cache = ReaderCache::new(&config);
+        let file = open(&cache, &paths[0]);
+        let actual = file.read_entry_ref(offset).unwrap();
+        assert_eq!(actual.get("MESSAGE"), Some(&payload[8..]));
+        assert_eq!(
+            snapshot(actual),
+            snapshot(
+                JournalFile::open(paths[0].clone(), &config)
+                    .unwrap()
+                    .read_entry_ref(offset)
+                    .unwrap()
+            )
+        );
+        for (config, kind) in [
+            (
+                JournalConfig {
+                    max_decompressed_bytes: 64,
+                    ..Default::default()
+                },
+                crate::error::LimitKind::DecompressedBytes,
+            ),
+            (
+                JournalConfig {
+                    max_object_size_bytes: 512,
+                    ..Default::default()
+                },
+                crate::error::LimitKind::ObjectSizeBytes,
+            ),
+        ] {
+            let cache = ReaderCache::new(&config);
+            let file = open(&cache, &paths[0]);
+            assert!(
+                matches!(file.read_entry_ref(offset), Err(SdJournalError::LimitExceeded { kind: actual, .. }) if actual == kind)
+            );
+            assert!(cache.entries.lock().unwrap().is_empty());
+        }
+        // Advertised output remains valid but truncated compressed bytes fail decoding.
+        patch(&paths[0], data + 8, &73u64.to_le_bytes());
+        assert!(matches!(
+            file.read_entry_ref(offset),
+            Err(SdJournalError::DecompressFailed { .. })
+        ));
     }
 
     #[test]

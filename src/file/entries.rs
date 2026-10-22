@@ -34,6 +34,14 @@ impl JournalFile {
     }
 
     pub(crate) fn read_entry_ref(&self, entry_offset: u64) -> Result<EntryRef> {
+        #[cfg(unix)]
+        if let super::Access::Cached(access) = &self.inner.access {
+            return access.read_entry(self, entry_offset);
+        }
+        self.read_entry_ref_inner(entry_offset)
+    }
+
+    pub(super) fn read_entry_ref_inner(&self, entry_offset: u64) -> Result<EntryRef> {
         let parsed = self.read_entry_header(entry_offset)?;
         let entry_bytes = self.read_object(entry_offset, parsed.size)?;
         let entry_bytes = entry_bytes.as_slice();

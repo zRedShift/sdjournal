@@ -69,6 +69,23 @@ enum Access {
 }
 
 impl JournalFile {
+    // Replace only access, never the caller's retained header/extent/config.
+    #[cfg(unix)]
+    fn with_direct_access(&self, access: Access) -> Self {
+        Self {
+            inner: Arc::new(JournalFileInner {
+                path: self.inner.path.clone(),
+                config: self.inner.config.clone(),
+                header: self.inner.header.clone(),
+                used_size: self.inner.used_size,
+                file_len: self.inner.file_len,
+                modified_at_open: self.inner.modified_at_open,
+                file_identity: self.inner.file_identity,
+                access,
+            }),
+        }
+    }
+
     pub(crate) fn open(path: PathBuf, config: &JournalConfig) -> Result<Self> {
         Self::open_with_access(path, config, false)
     }
