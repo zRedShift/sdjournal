@@ -74,7 +74,7 @@ impl ReaderCache {
             .entries
             .lock()
             .map_err(|_| transient(&path, "journal reader cache lock poisoned"))?;
-        let mut reader = if let Some(index) = entries.iter().position(|entry| entry.path == path) {
+        let mut reader = if let Some(index) = entries.iter().rposition(|entry| entry.path == path) {
             entries
                 .remove(index)
                 .ok_or_else(|| transient(&path, "journal reader cache slot disappeared"))?
@@ -153,9 +153,9 @@ impl CachedReader {
         {
             return Err(transient(path, "journal file was replaced after discovery"));
         }
-        let bytes =
-            FileAccess::new(path.to_owned(), Arc::clone(&self.file)).read_known_valid(0, 88)?;
-        let header = bytes.as_slice();
+        let mut header = [0u8; 88];
+        crate::reader::read_exact_at(self.file.as_ref(), 0, &mut header)
+            .map_err(|error| crate::reader::read_failure(path, 0, header.len(), error))?;
         if self.file_id != file_id
             || self.seqnum_id != seqnum_id
             || header[24..40] != file_id
@@ -244,7 +244,7 @@ impl CachedAccess {
             .lock()
             .map_err(|_| transient(&self.path, "journal reader cache lock poisoned"))?;
         let mut reader =
-            if let Some(index) = entries.iter().position(|entry| entry.path == self.path) {
+            if let Some(index) = entries.iter().rposition(|entry| entry.path == self.path) {
                 entries
                     .remove(index)
                     .ok_or_else(|| transient(&self.path, "journal reader cache slot disappeared"))?

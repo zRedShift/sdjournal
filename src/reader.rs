@@ -217,7 +217,12 @@ impl ReopenAccess {
     }
 }
 
-fn read_failure(path: &Path, offset: u64, len: usize, error: std::io::Error) -> SdJournalError {
+pub(crate) fn read_failure(
+    path: &Path,
+    offset: u64,
+    len: usize,
+    error: std::io::Error,
+) -> SdJournalError {
     if error.kind() == std::io::ErrorKind::UnexpectedEof {
         SdJournalError::Transient {
             path: Some(path.to_path_buf()),
@@ -293,7 +298,11 @@ impl MmapAccess {
 }
 
 #[cfg(unix)]
-fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: &File,
+    mut offset: u64,
+    mut buf: &mut [u8],
+) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt as _;
     while !buf.is_empty() {
         let n = file.read_at(buf, offset)?;
@@ -310,7 +319,11 @@ fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::R
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: &File,
+    mut offset: u64,
+    mut buf: &mut [u8],
+) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt as _;
     while !buf.is_empty() {
         let n = file.seek_read(buf, offset)?;
@@ -327,7 +340,7 @@ fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::R
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut f = file.try_clone()?;
     f.seek(SeekFrom::Start(offset))?;
