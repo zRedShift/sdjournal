@@ -1,7 +1,13 @@
+#[cfg(unix)]
+mod cache;
 mod decompress;
 mod entries;
 mod index;
 mod iter;
+#[cfg(unix)]
+use cache::CachedAccess;
+#[cfg(unix)]
+pub(crate) use cache::ReaderCache;
 
 use crate::config::JournalConfig;
 #[cfg(feature = "mmap")]
@@ -54,6 +60,8 @@ struct JournalFileInner {
 
 #[derive(Clone)]
 enum Access {
+    #[cfg(unix)]
+    Cached(CachedAccess),
     #[cfg(feature = "mmap")]
     Mmap(MmapAccess),
     File(FileAccess),
@@ -65,6 +73,7 @@ impl JournalFile {
         Self::open_with_access(path, config, false)
     }
 
+    #[cfg(not(unix))]
     pub(crate) fn open_reopen(path: PathBuf, config: &JournalConfig) -> Result<Self> {
         Self::open_with_access(path, config, true)
     }
@@ -450,6 +459,8 @@ impl JournalFile {
         }
 
         match &self.inner.access {
+            #[cfg(unix)]
+            Access::Cached(access) => access.read_known_valid(offset, len),
             Access::File(access) => access.read_known_valid(offset, len),
             Access::Reopen(access) => access.read_known_valid(offset, len),
             #[cfg(feature = "mmap")]

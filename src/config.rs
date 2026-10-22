@@ -79,6 +79,9 @@ pub struct JournalConfig {
     ///
     /// Queries switch to a low-memory streaming merge when discovery finds more files than this
     /// limit. Set this to `1` for the lowest file-descriptor and mmap footprint.
+    /// On Unix, lazy reads reuse a cache of at most this many descriptors/stable mappings;
+    /// their returned entry payloads are owned, so retaining entries cannot pin evicted readers.
+    /// Interleaved working sets larger than the budget can still cause cache misses.
     pub max_open_files: usize,
 
     /// Runtime mmap policy.

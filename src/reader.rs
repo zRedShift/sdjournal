@@ -14,15 +14,47 @@ pub(crate) mod test_io {
     };
     thread_local! {
         static OPENS: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
+        static OBSERVED: RefCell<Option<(PathBuf, (usize, usize))>> = const { RefCell::new(None) };
     }
     pub(crate) fn opened(path: &Path) {
         OPENS.with(|counts| *counts.borrow_mut().entry(path.to_owned()).or_default() += 1);
+        observed(path);
     }
     pub(crate) fn reset() {
         OPENS.with(|counts| counts.borrow_mut().clear());
     }
     pub(crate) fn opens(path: &Path) -> usize {
         OPENS.with(|counts| counts.borrow().get(path).copied().unwrap_or(0))
+    }
+    pub(crate) fn observe_root(path: &Path) {
+        OBSERVED.with(|slot| *slot.borrow_mut() = Some((path.to_owned(), (0, 0))));
+    }
+    pub(crate) fn peaks() -> (usize, usize) {
+        OBSERVED.with(|slot| slot.borrow().as_ref().map_or((0, 0), |(_, peak)| *peak))
+    }
+    pub(crate) fn observed(path: &Path) {
+        #[cfg(target_os = "linux")]
+        OBSERVED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some((root, peak)) = slot.as_mut().filter(|(root, _)| path.starts_with(root))
+            else {
+                return;
+            };
+            let fds = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|v| std::fs::read_link(v.unwrap().path()).ok())
+                .filter(|p| p.starts_with(&*root))
+                .count();
+            let maps = std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(root.to_str().unwrap()))
+                .count();
+            peak.0 = peak.0.max(fds);
+            peak.1 = peak.1.max(maps);
+        });
+        #[cfg(not(target_os = "linux"))]
+        let _ = path;
     }
 }
 
@@ -208,6 +240,8 @@ pub(crate) struct MmapAccess {
 #[cfg(feature = "mmap")]
 impl MmapAccess {
     pub(crate) fn new(path: PathBuf, file: Arc<File>, map: Arc<Mmap>) -> Self {
+        #[cfg(test)]
+        test_io::observed(&path);
         #[cfg(not(test))]
         let _ = file;
         Self {

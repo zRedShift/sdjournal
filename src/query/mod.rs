@@ -556,6 +556,8 @@ mod tests {
     fn empty_journal_with_config(config: JournalConfig) -> Journal {
         Journal {
             inner: Arc::new(JournalInner {
+                #[cfg(unix)]
+                reader_cache: crate::file::ReaderCache::new(&config),
                 config,
                 roots: Vec::new(),
                 file_infos: Vec::new(),

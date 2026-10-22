@@ -21,6 +21,8 @@ pub struct Journal {
 }
 
 pub(crate) struct JournalInner {
+    #[cfg(unix)]
+    pub(crate) reader_cache: Arc<crate::file::ReaderCache>,
     pub(crate) config: JournalConfig,
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) file_infos: Vec<JournalFileInfo>,
@@ -124,6 +126,8 @@ impl Journal {
 
         Ok(Self {
             inner: Arc::new(JournalInner {
+                #[cfg(unix)]
+                reader_cache: crate::file::ReaderCache::new(&config),
                 config,
                 roots: discovery.roots,
                 file_infos: file_set.file_infos,
@@ -211,6 +215,11 @@ impl JournalInner {
         if let Some(file) = &info.file {
             return Ok(file.clone());
         }
+        #[cfg(unix)]
+        let file = self
+            .reader_cache
+            .open_file(info.path.clone(), info.file_id, info.seqnum_id)?;
+        #[cfg(not(unix))]
         let file = JournalFile::open_reopen(info.path.clone(), &self.config)?;
         if file.file_id() != info.file_id || file.seqnum_id() != info.seqnum_id {
             return Err(SdJournalError::Transient {
@@ -259,6 +268,8 @@ pub(crate) fn journal_from_snapshot_files(
     }
     Ok(Journal {
         inner: Arc::new(JournalInner {
+            #[cfg(unix)]
+            reader_cache: crate::file::ReaderCache::new(&config),
             config,
             roots,
             file_infos,
@@ -483,6 +494,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn lazy_hot_reads_do_not_reopen_for_each_field_above_default_budget() {
         let root = tempdir().unwrap();
