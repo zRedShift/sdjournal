@@ -43,6 +43,18 @@ fn transient(path: &Path, reason: &str) -> SdJournalError {
     }
 }
 
+fn open_error(path: &Path, error: std::io::Error) -> SdJournalError {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        SdJournalError::PermissionDenied {
+            path: path.to_owned(),
+        }
+    } else {
+        // Cache path validation has the same logical open-failure contract as
+        // the old lazy reopen, even when no new descriptor is needed.
+        SdJournalError::io("open", Some(path.to_owned()), error)
+    }
+}
+
 impl ReaderCache {
     pub(crate) fn new(config: &JournalConfig) -> Arc<Self> {
         Arc::new(Self {
@@ -65,7 +77,7 @@ impl ReaderCache {
         let mut reader = if let Some(index) = entries.iter().position(|entry| entry.path == path) {
             entries
                 .remove(index)
-                .expect("position identifies an occupied cache slot")
+                .ok_or_else(|| transient(&path, "journal reader cache slot disappeared"))?
         } else {
             if entries.len() == self.config.max_open_files {
                 drop(entries.pop_front());
@@ -91,9 +103,9 @@ impl ReaderCache {
         reader.mapped_len = snapshot.inner.file_len;
         let identity = snapshot.inner.file_identity;
         // This freshly constructed snapshot has no other owners yet.
-        Arc::get_mut(&mut snapshot.inner)
-            .expect("new snapshot is uniquely owned")
-            .access = Access::Cached(CachedAccess {
+        let inner = Arc::get_mut(&mut snapshot.inner)
+            .ok_or_else(|| transient(&path, "new journal snapshot unexpectedly shared"))?;
+        inner.access = Access::Cached(CachedAccess {
             path,
             identity,
             file_id,
@@ -108,13 +120,7 @@ impl ReaderCache {
 impl CachedReader {
     fn open(path: PathBuf, config: &JournalConfig) -> Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
-        let file = Arc::new(File::open(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                SdJournalError::PermissionDenied { path: path.clone() }
-            } else {
-                SdJournalError::io("open", Some(path.clone()), error)
-            }
-        })?);
+        let file = Arc::new(File::open(&path).map_err(|error| open_error(&path, error))?);
         #[cfg(test)]
         crate::reader::test_io::opened(&path);
         let metadata = file
@@ -141,8 +147,7 @@ impl CachedReader {
         seqnum_id: [u8; 16],
     ) -> Result<(u8, u64)> {
         use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| SdJournalError::io("metadata", Some(path.to_owned()), e))?;
+        let metadata = std::fs::metadata(path).map_err(|error| open_error(path, error))?;
         if (metadata.dev(), metadata.ino()) != self.identity
             || identity.is_some_and(|id| id != self.identity)
         {
@@ -242,7 +247,7 @@ impl CachedAccess {
             if let Some(index) = entries.iter().position(|entry| entry.path == self.path) {
                 entries
                     .remove(index)
-                    .expect("position identifies an occupied cache slot")
+                    .ok_or_else(|| transient(&self.path, "journal reader cache slot disappeared"))?
             } else {
                 if entries.len() == self.cache.config.max_open_files {
                     drop(entries.pop_front());
