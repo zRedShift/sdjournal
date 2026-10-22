@@ -5,6 +5,27 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+pub(crate) mod test_io {
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        path::{Path, PathBuf},
+    };
+    thread_local! {
+        static OPENS: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
+    }
+    pub(crate) fn opened(path: &Path) {
+        OPENS.with(|counts| *counts.borrow_mut().entry(path.to_owned()).or_default() += 1);
+    }
+    pub(crate) fn reset() {
+        OPENS.with(|counts| counts.borrow_mut().clear());
+    }
+    pub(crate) fn opens(path: &Path) -> usize {
+        OPENS.with(|counts| counts.borrow().get(path).copied().unwrap_or(0))
+    }
+}
+
 #[cfg(feature = "mmap")]
 use memmap2::Mmap;
 
@@ -138,6 +159,8 @@ impl ReopenAccess {
                 SdJournalError::io("open", Some(self.path.clone()), error)
             }
         })?;
+        #[cfg(test)]
+        test_io::opened(&self.path);
 
         let mut identity = [0u8; 88];
         if let Err(error) = read_exact_at(&file, 0, &mut identity) {

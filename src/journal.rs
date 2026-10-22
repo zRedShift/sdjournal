@@ -475,6 +475,69 @@ mod tests {
     use std::fs::{self, File};
     use tempfile::tempdir;
 
+    #[allow(dead_code)]
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/synthetic_journal.rs"
+        ));
+    }
+
+    #[test]
+    fn lazy_hot_reads_do_not_reopen_for_each_field_above_default_budget() {
+        let root = tempdir().unwrap();
+        let units = ["hot.service"; 8];
+        for seed in 1u8..=65 {
+            fixture::write_synthetic_journal_file(
+                &root.path().join(format!("{seed:03}.journal")),
+                &units,
+                seed,
+            );
+        }
+        let eager = Journal::open_dir_with_config(
+            root.path(),
+            JournalConfig {
+                max_open_files: 65,
+                ..JournalConfig::default()
+            },
+        )
+        .unwrap();
+        let snapshot = |entry: crate::entry::EntryRef| {
+            (
+                entry.cursor().unwrap().to_string(),
+                entry
+                    .iter_fields()
+                    .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let expected: Vec<_> = eager
+            .query()
+            .iter()
+            .unwrap()
+            .map(|v| snapshot(v.unwrap()))
+            .collect();
+        assert_eq!(expected.len(), 65 * units.len());
+        drop(eager);
+        let lazy = Journal::open_dir(root.path()).unwrap();
+        assert!(lazy.inner.is_lazy());
+        let mut iter = lazy.query().iter().unwrap();
+        crate::reader::test_io::reset();
+        let hot: Vec<_> = iter
+            .by_ref()
+            .take(4)
+            .map(|v| snapshot(v.unwrap()))
+            .collect();
+        assert_eq!(hot, expected[..4]);
+        let opens = crate::reader::test_io::opens(&root.path().join("001.journal"));
+        assert!(
+            opens <= 1,
+            "four hot entries reopened their file {opens} times"
+        );
+        let rest: Vec<_> = iter.map(|v| snapshot(v.unwrap())).collect();
+        assert_eq!(rest, expected[4..]);
+    }
+
     #[test]
     fn open_dirs_rejects_empty_path_list() {
         match Journal::open_dirs_with_config(&[], JournalConfig::default()) {

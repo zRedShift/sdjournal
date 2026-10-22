@@ -101,6 +101,8 @@ impl JournalFile {
                 SdJournalError::io("open", Some(path.clone()), e)
             }
         })?);
+        #[cfg(test)]
+        crate::reader::test_io::opened(&path);
 
         Self::open_from_file(path, file, config, reopen_each_read)
     }
