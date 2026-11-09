@@ -31,6 +31,7 @@ pub(crate) struct JournalInner {
     pub(crate) config: JournalConfig,
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) file_infos: Vec<JournalFileInfo>,
+    pub(crate) open_errors: Vec<(PathBuf, SdJournalError)>,
 }
 
 #[derive(Clone)]
@@ -139,6 +140,7 @@ impl Journal {
                 config,
                 roots: discovery.roots,
                 file_infos: file_set.file_infos,
+                open_errors: file_set.errors,
             }),
         })
     }
@@ -146,6 +148,17 @@ impl Journal {
     /// Start building a query over the currently opened journal files.
     pub fn query(&self) -> JournalQuery {
         JournalQuery::new(self.clone())
+    }
+
+    /// Individual files excluded because opening them failed.
+    ///
+    /// Opening remains best-effort when other files are usable. This borrowed
+    /// list retains their actual discovery paths and typed errors, independent
+    /// of the optional tracing feature. Its length is bounded by
+    /// `JournalConfig::max_journal_files`. Retirement is returned directly for
+    /// rediscovery; corruption while iterating included data is not skipped.
+    pub fn open_errors(&self) -> &[(PathBuf, SdJournalError)] {
+        &self.inner.open_errors
     }
 
     /// Create a shared live engine from this journal set.
@@ -186,6 +199,7 @@ impl Journal {
 
 pub(crate) struct JournalFileSet {
     pub(crate) file_infos: Vec<JournalFileInfo>,
+    errors: Vec<(PathBuf, SdJournalError)>,
 }
 
 impl JournalInner {
@@ -316,6 +330,7 @@ pub(crate) fn journal_from_snapshot_files(
             config,
             roots,
             file_infos,
+            open_errors: Vec::new(),
         }),
     })
 }
@@ -342,7 +357,7 @@ fn open_eager_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jo
     let mut errors = Vec::new();
     let mut seen: HashSet<[u8; 16]> = HashSet::new();
     for path in paths {
-        match JournalFile::open(path, config) {
+        match JournalFile::open(path.clone(), config) {
             Ok(f) => {
                 #[cfg(feature = "tracing")]
                 debug!(path = %f.path().display(), "opened journal file");
@@ -355,7 +370,7 @@ fn open_eager_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jo
             Err(e) => {
                 #[cfg(feature = "tracing")]
                 warn!(error = %e, "failed to open journal file");
-                errors.push(e)
+                errors.push((path, e))
             }
         }
     }
@@ -364,10 +379,11 @@ fn open_eager_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jo
         return Err(errors
             .into_iter()
             .next()
+            .map(|(_, error)| error)
             .unwrap_or(SdJournalError::NotFound));
     }
 
-    Ok(JournalFileSet { file_infos })
+    Ok(JournalFileSet { file_infos, errors })
 }
 
 fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<JournalFileSet> {
@@ -387,7 +403,7 @@ fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jou
             Err(e) => {
                 #[cfg(feature = "tracing")]
                 warn!(error = %e, "failed to validate journal file for lazy open");
-                errors.push(e);
+                errors.push((path, e));
             }
         }
     }
@@ -396,10 +412,11 @@ fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jou
         return Err(errors
             .into_iter()
             .next()
+            .map(|(_, error)| error)
             .unwrap_or(SdJournalError::NotFound));
     }
 
-    Ok(JournalFileSet { file_infos })
+    Ok(JournalFileSet { file_infos, errors })
 }
 
 pub(crate) fn discover_journal_candidates(
@@ -605,6 +622,31 @@ mod tests {
             }
             Ok(_) => panic!("expected InvalidQuery"),
             Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn retirement_between_discovery_and_open_is_not_silently_excluded() {
+        for max_open_files in [1, 64] {
+            let root = tempdir().unwrap();
+            let healthy = root.path().join("healthy.journal");
+            let retired = root.path().join("retired.journal");
+            fixture::write_synthetic_journal_file(&healthy, &["healthy.service"], 1);
+            fixture::write_synthetic_journal_file(&retired, &["retired.service"], 2);
+            let mut candidates = Vec::new();
+            let config = JournalConfig {
+                max_open_files,
+                ..JournalConfig::default()
+            };
+            discover_journal_paths(root.path(), &config, &mut candidates).unwrap();
+            fs::remove_file(&retired).unwrap();
+            assert!(matches!(
+                open_journal_file_set(candidates, &config),
+                Err(SdJournalError::Retired {
+                    path,
+                    reason: crate::RetirementReason::Disappeared,
+                }) if path == retired
+            ));
         }
     }
 

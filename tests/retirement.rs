@@ -287,24 +287,97 @@ fn lazy_replacement_is_retirement_not_linked_corruption() {
 
 fn pending_corruption_case(later_healthy: bool) {
     use std::os::unix::fs::FileExt as _;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("a.journal");
-        write_synthetic_journal_file(&path, &["a.service";3], 7);
-        if later_healthy { write_synthetic_journal_file(&root.path().join("b.journal"), &["b.service"], 9); }
-        let journal = Journal::open_dir_with_config(root.path(), config(MmapPolicy::Never,64)).unwrap();
-        let entries = journal.query().collect_owned().unwrap();
-        let mut query=journal.query(); query.after_cursor(entries[1].cursor().unwrap());
-        let mut iter=query.iter().unwrap();
-        let file=OpenOptions::new().read(true).write(true).open(path).unwrap();
-        let mut offset=[0;8];file.read_exact_at(&mut offset,176).unwrap();
-        let array=u64::from_le_bytes(offset);file.read_exact_at(&mut offset,array+24+2*8).unwrap();
-        file.write_all_at(&[0],u64::from_le_bytes(offset)).unwrap();
-        let item=iter.next();
-        assert!(matches!(item,Some(Err(sdjournal::SdJournalError::Corrupt {..}))), "linked third-entry corruption before later_healthy={later_healthy}: {item:?}");
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("a.journal");
+    write_synthetic_journal_file(&path, &["a.service"; 3], 7);
+    if later_healthy {
+        write_synthetic_journal_file(&root.path().join("b.journal"), &["b.service"], 9);
+    }
+    let journal =
+        Journal::open_dir_with_config(root.path(), config(MmapPolicy::Never, 64)).unwrap();
+    let entries = journal.query().collect_owned().unwrap();
+    let mut query = journal.query();
+    query.after_cursor(entries[1].cursor().unwrap());
+    let mut iter = query.iter().unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut offset = [0; 8];
+    file.read_exact_at(&mut offset, 176).unwrap();
+    let array = u64::from_le_bytes(offset);
+    file.read_exact_at(&mut offset, array + 24 + 2 * 8).unwrap();
+    file.write_all_at(&[0], u64::from_le_bytes(offset)).unwrap();
+    let item = iter.next();
+    assert!(
+        matches!(item, Some(Err(sdjournal::SdJournalError::Corrupt { .. }))),
+        "linked third-entry corruption before later_healthy={later_healthy}: {item:?}"
+    );
 }
 
 #[test]
-fn pending_corruption_cannot_be_hidden_at_cursor_eof() { pending_corruption_case(false); }
+fn pending_corruption_cannot_be_hidden_at_cursor_eof() {
+    pending_corruption_case(false);
+}
 
 #[test]
-fn pending_corruption_cannot_be_hidden_before_later_healthy_rows() { pending_corruption_case(true); }
+fn pending_corruption_cannot_be_hidden_before_later_healthy_rows() {
+    pending_corruption_case(true);
+}
+
+#[test]
+fn initial_bad_file_has_path_and_typed_diagnostic_without_blocking_healthy_files() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let bad = root.path().join("bad.journal");
+        fs::write(&bad, [0; 272]).unwrap();
+        write_synthetic_journal_file(
+            &root.path().join("healthy.journal"),
+            &["healthy.service"],
+            8,
+        );
+        let journal =
+            Journal::open_dir_with_config(root.path(), config(MmapPolicy::Never, budget)).unwrap();
+        assert_eq!(journal.open_errors().len(), 1);
+        let (path, error) = &journal.open_errors()[0];
+        assert_eq!(path, &bad);
+        assert!(matches!(
+            error,
+            sdjournal::SdJournalError::Unsupported { .. }
+        ));
+        let entries = journal.query().collect_owned().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].get("_SYSTEMD_UNIT"),
+            Some(b"healthy.service".as_slice())
+        );
+        assert_eq!(
+            journal.open_errors().len(),
+            1,
+            "query does not consume the diagnostics"
+        );
+    }
+}
+
+#[test]
+fn excluded_files_do_not_bypass_the_discovery_file_limit() {
+    let root = tempfile::tempdir().unwrap();
+    for n in 0..3 {
+        fs::write(root.path().join(format!("{n}.journal")), [0; 272]).unwrap();
+    }
+    let result = Journal::open_dir_with_config(
+        root.path(),
+        JournalConfig {
+            max_journal_files: 2,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(sdjournal::SdJournalError::LimitExceeded {
+            kind: sdjournal::LimitKind::JournalFiles,
+            ..
+        })
+    ));
+}

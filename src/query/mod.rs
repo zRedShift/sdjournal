@@ -561,6 +561,7 @@ mod tests {
                 config,
                 roots: Vec::new(),
                 file_infos: Vec::new(),
+                open_errors: Vec::new(),
             }),
         }
     }

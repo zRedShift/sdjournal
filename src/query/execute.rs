@@ -138,11 +138,10 @@ impl Iterator for FileOrIter {
             return None;
         }
 
-        if let Some(err) = self.pending_error.take() {
-            return Some(Err(err));
-        }
-
         loop {
+            if let Some(err) = self.pending_error.take() {
+                return Some(Err(err));
+            }
             let item = match self.pop_next() {
                 Some(item) => item,
                 None => {
@@ -424,11 +423,10 @@ impl Iterator for OffsetOrIter {
             return None;
         }
 
-        if let Some(err) = self.pending_error.take() {
-            return Some(Err(err));
-        }
-
         loop {
+            if let Some(err) = self.pending_error.take() {
+                return Some(Err(err));
+            }
             let item = match self.pop_next() {
                 Some(item) => item,
                 None => {
@@ -921,22 +919,21 @@ impl Iterator for EagerJournalIter {
             return None;
         }
 
-        if let Some(err) = self.pending_error.take() {
-            // Construction errors can have been caused by vacuum after opening.
-            if let Err(retired @ SdJournalError::Retired { .. }) = self.validate_files() {
-                return Some(Err(retired));
-            }
-            return Some(Err(err));
-        }
-
-        if let Some(limit) = self.query.limit
-            && (limit == 0 || self.produced >= limit)
-        {
-            self.done = true;
-            return None;
-        }
-
         loop {
+            if let Some(err) = self.pending_error.take() {
+                // Construction errors can have been caused by vacuum after opening.
+                if let Err(retired @ SdJournalError::Retired { .. }) = self.validate_files() {
+                    return Some(Err(retired));
+                }
+                return Some(Err(err));
+            }
+
+            if let Some(limit) = self.query.limit
+                && (limit == 0 || self.produced >= limit)
+            {
+                self.done = true;
+                return None;
+            }
             let item = match self.pop_next() {
                 Some(item) => item,
                 None => {
@@ -1033,5 +1030,122 @@ where
             pending.get_or_insert(error);
             None
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pending_error_tests {
+    use super::*;
+    use crate::{JournalConfig, MmapPolicy};
+    use std::{fs::OpenOptions, os::unix::fs::FileExt as _};
+    #[allow(dead_code)]
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/synthetic_journal.rs"
+        ));
+    }
+
+    #[test]
+    fn file_or_duplicate_does_not_hide_branch_error_before_a_later_row() {
+        let layout = fixture::SyntheticJournalFile::new(&["a.service"; 3]);
+        let path = layout.root().join("synthetic.journal");
+        let file = JournalFile::open(
+            path.clone(),
+            &JournalConfig {
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut iter = FileOrIter::new(
+            vec![
+                FileBranchIter::new(file.clone(), vec![], false, None, None, None).unwrap(),
+                FileBranchIter::new(file, vec![], false, None, None, None).unwrap(),
+            ],
+            false,
+        );
+        assert_eq!(iter.next().unwrap().unwrap().seqnum, 1);
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut offset = [0; 8];
+        owner.read_exact_at(&mut offset, 176).unwrap();
+        let array = u64::from_le_bytes(offset);
+        owner.read_exact_at(&mut offset, array + 24 + 8).unwrap();
+        owner
+            .write_all_at(&[0], u64::from_le_bytes(offset))
+            .unwrap();
+        assert!(matches!(
+            iter.next(),
+            Some(Err(SdJournalError::Corrupt { .. }))
+        ));
+    }
+
+    #[test]
+    fn offset_or_duplicate_does_not_turn_array_error_into_eof() {
+        let layout = fixture::SyntheticJournalFile::new(&["a.service"; 3]);
+        let path = layout.root().join("synthetic.journal");
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut bytes = [0; 8];
+        owner.read_exact_at(&mut bytes, 176).unwrap();
+        let global = u64::from_le_bytes(bytes);
+        let mut offsets = [0u64; 3];
+        for (index, offset) in offsets.iter_mut().enumerate() {
+            owner
+                .read_exact_at(&mut bytes, global + 24 + index as u64 * 8)
+                .unwrap();
+            *offset = u64::from_le_bytes(bytes);
+        }
+        // A DATA index may contain one direct entry plus an ENTRY_ARRAY suffix.
+        // Add that valid suffix as a real object; retain the original global index.
+        let array = owner.metadata().unwrap().len();
+        let mut object = [0u8; 56];
+        object[0] = crate::format::OBJECT_ENTRY_ARRAY;
+        object[8..16].copy_from_slice(&56u64.to_le_bytes());
+        object[24..32].copy_from_slice(&offsets[1].to_le_bytes());
+        object[32..40].copy_from_slice(&offsets[2].to_le_bytes());
+        owner.write_all_at(&object, array).unwrap();
+        owner
+            .write_all_at(&(array + 56 - 272).to_le_bytes(), 96)
+            .unwrap();
+        owner.write_all_at(&array.to_le_bytes(), 136).unwrap();
+        owner.write_all_at(&[2], 16).unwrap();
+        let file = JournalFile::open(
+            path,
+            &JournalConfig {
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let direct = file
+            .find_data_objects(b"_SYSTEMD_UNIT=a.service")
+            .unwrap()
+            .into_iter()
+            .find(|data| data.entry_offset == offsets[0])
+            .unwrap();
+        let mut suffix = direct;
+        suffix.n_entries = 3;
+        suffix.entry_array_offset = array;
+        let mut iter = OffsetOrIter::new(
+            vec![
+                DataEntryOffsetIter::new(file.clone(), direct, false).unwrap(),
+                DataEntryOffsetIter::new(file, suffix, false).unwrap(),
+            ],
+            false,
+        );
+        assert_eq!(iter.next().unwrap().unwrap(), offsets[0]);
+        owner.write_all_at(&0u64.to_le_bytes(), array + 24).unwrap();
+        assert!(matches!(
+            iter.next(),
+            Some(Err(SdJournalError::Corrupt { .. }))
+        ));
     }
 }
