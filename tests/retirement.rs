@@ -284,3 +284,27 @@ fn lazy_replacement_is_retirement_not_linked_corruption() {
     fs::rename(replacement, path).unwrap();
     retired(iter.next().unwrap().unwrap_err());
 }
+
+fn pending_corruption_case(later_healthy: bool) {
+    use std::os::unix::fs::FileExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.journal");
+        write_synthetic_journal_file(&path, &["a.service";3], 7);
+        if later_healthy { write_synthetic_journal_file(&root.path().join("b.journal"), &["b.service"], 9); }
+        let journal = Journal::open_dir_with_config(root.path(), config(MmapPolicy::Never,64)).unwrap();
+        let entries = journal.query().collect_owned().unwrap();
+        let mut query=journal.query(); query.after_cursor(entries[1].cursor().unwrap());
+        let mut iter=query.iter().unwrap();
+        let file=OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut offset=[0;8];file.read_exact_at(&mut offset,176).unwrap();
+        let array=u64::from_le_bytes(offset);file.read_exact_at(&mut offset,array+24+2*8).unwrap();
+        file.write_all_at(&[0],u64::from_le_bytes(offset)).unwrap();
+        let item=iter.next();
+        assert!(matches!(item,Some(Err(sdjournal::SdJournalError::Corrupt {..}))), "linked third-entry corruption before later_healthy={later_healthy}: {item:?}");
+}
+
+#[test]
+fn pending_corruption_cannot_be_hidden_at_cursor_eof() { pending_corruption_case(false); }
+
+#[test]
+fn pending_corruption_cannot_be_hidden_before_later_healthy_rows() { pending_corruption_case(true); }

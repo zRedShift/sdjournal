@@ -17,6 +17,7 @@ use crate::{
 thread_local! {
     static VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ENTRY_END_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static HEADER_READ_HOOK: std::cell::RefCell<Option<(usize, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) struct ReaderCache {
@@ -172,6 +173,11 @@ impl CachedReader {
             });
         }
         let mut header = [0u8; 88];
+        #[cfg(test)]
+        HEADER_READ_HOOK.with(|slot| {
+            let run = slot.borrow().as_ref().is_some_and(|(at,_)| *at == VALIDATIONS.with(std::cell::Cell::get));
+            if run { let (_,hook) = slot.borrow_mut().take().unwrap(); hook(); }
+        });
         crate::reader::read_exact_at(self.file.as_ref(), 0, &mut header)
             .map_err(|error| crate::reader::read_failure(path, 0, header.len(), error))?;
         if &header[..8] != crate::format::HEADER_SIGNATURE {
@@ -464,6 +470,31 @@ mod tests {
             let validations = VALIDATIONS.with(std::cell::Cell::get);
             assert_eq!(validations, 2, "warm six-field entry validation count");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cached_validation_unlink_races_are_retirement_at_both_header_boundaries() {
+        let mut observed=Vec::new();
+        for phase in [1,2] {
+            for truncate in [false,true] {
+                let (_root, paths) = files(1);
+                let cache = ReaderCache::new(&JournalConfig { mmap_policy: crate::MmapPolicy::Never, ..Default::default() });
+                let file = open(&cache, &paths[0]);
+                let offset = file.inner.header.tail_entry_offset.unwrap();
+                let path = paths[0].clone();
+                VALIDATIONS.with(|count| count.set(0));
+                HEADER_READ_HOOK.with(|slot| *slot.borrow_mut() = Some((phase,Box::new(move || {
+                    let owner = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    std::fs::remove_file(path).unwrap();
+                    if truncate { owner.set_len(0).unwrap(); }
+                    else { rustix::fs::fallocate(&owner, rustix::fs::FallocateFlags::PUNCH_HOLE | rustix::fs::FallocateFlags::KEEP_SIZE, 0, owner.metadata().unwrap().len()).unwrap(); }
+                }))));
+                let result=file.read_entry_ref(offset);
+                observed.push((phase,truncate,matches!(result,Err(SdJournalError::Retired { reason: crate::RetirementReason::Unlinked, .. })),format!("{result:?}")));
+            }
+        }
+        assert!(observed.iter().all(|row|row.2), "{observed:?}");
     }
 
     #[test]
