@@ -308,8 +308,25 @@ impl JournalFile {
                 format!("DATA object offset is not 8-byte aligned: {offset}"),
             ));
         }
-        let oh_bytes = self.read_bytes(offset, 16)?;
-        let oh = ObjectHeader::parse(oh_bytes.as_slice(), self.path(), offset)?;
+        let min_size = if self.inner.header.is_compact() {
+            72u64
+        } else {
+            64u64
+        };
+        // Parse the object header and DATA metadata from the same fixed prefix.
+        // At a malformed short logical tail, keep the original header-only
+        // read so type/size/limit diagnostics still precede the range error.
+        let prefix_len = if offset
+            .checked_add(min_size)
+            .is_some_and(|end| end <= self.inner.used_size)
+        {
+            min_size as usize
+        } else {
+            16
+        };
+        let buf = self.read_bytes(offset, prefix_len)?;
+        let buf = buf.as_slice();
+        let oh = ObjectHeader::parse(buf, self.path(), offset)?;
         if oh.object_type != OBJECT_DATA {
             return Err(SdJournalError::Corrupt {
                 path: Some(self.inner.path.clone()),
@@ -318,11 +335,6 @@ impl JournalFile {
             });
         }
 
-        let min_size = if self.inner.header.is_compact() {
-            72u64
-        } else {
-            64u64
-        };
         if oh.size < min_size {
             return Err(SdJournalError::Corrupt {
                 path: Some(self.inner.path.clone()),
@@ -348,9 +360,6 @@ impl JournalFile {
                 ),
             ));
         }
-
-        let buf = self.read_bytes(offset, usize::try_from(min_size).unwrap_or(usize::MAX))?;
-        let buf = buf.as_slice();
 
         let hash = read_u64_le(buf, 16).ok_or_else(|| SdJournalError::Corrupt {
             path: Some(self.inner.path.clone()),
