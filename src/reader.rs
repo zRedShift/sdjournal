@@ -38,9 +38,14 @@ pub(crate) mod test_io {
         collections::HashMap,
         path::{Path, PathBuf},
     };
+    #[cfg(unix)]
+    type AfterRead = Option<(usize, Box<dyn FnOnce()>)>;
     thread_local! {
         static OPENS: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
         static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        #[cfg(unix)]
+        static AFTER_READ: RefCell<AfterRead> = const { RefCell::new(None) };
         #[cfg(unix)]
         static READ_STEPS: RefCell<std::collections::VecDeque<std::result::Result<usize, std::io::ErrorKind>>> = const { RefCell::new(std::collections::VecDeque::new()) };
         static OBSERVED: RefCell<Option<(PathBuf, (usize, usize))>> = const { RefCell::new(None) };
@@ -52,12 +57,18 @@ pub(crate) mod test_io {
     pub(crate) fn reset() {
         OPENS.with(|counts| counts.borrow_mut().clear());
         READS.with(|count| count.set(0));
+        READ_BYTES.with(|count| count.set(0));
+        #[cfg(unix)]
+        AFTER_READ.with(|slot| *slot.borrow_mut() = None);
     }
     pub(crate) fn read_call() {
         READS.with(|count| count.set(count.get() + 1));
     }
     pub(crate) fn reads() -> usize {
         READS.with(std::cell::Cell::get)
+    }
+    pub(crate) fn read_bytes() -> usize {
+        READ_BYTES.with(std::cell::Cell::get)
     }
     #[cfg(unix)]
     pub(crate) fn read_at(
@@ -72,7 +83,22 @@ pub(crate) mod test_io {
             None => buf.len(),
         };
         read_call();
-        file.read_at(&mut buf[..limit], offset)
+        let result = file.read_at(&mut buf[..limit], offset);
+        if let Ok(n) = result {
+            READ_BYTES.with(|count| count.set(count.get() + n));
+        }
+        AFTER_READ.with(|slot| {
+            let run = slot.borrow().as_ref().is_some_and(|(at, _)| *at == reads());
+            if run {
+                let (_, hook) = slot.borrow_mut().take().unwrap();
+                hook();
+            }
+        });
+        result
+    }
+    #[cfg(unix)]
+    pub(crate) fn after_read(at: usize, hook: impl FnOnce() + 'static) {
+        AFTER_READ.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
     }
     #[cfg(unix)]
     pub(crate) fn read_steps(

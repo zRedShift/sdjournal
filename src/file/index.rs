@@ -68,7 +68,7 @@ mod prefix_tests {
     }
 
     #[test]
-    fn data_prefix_metadata_and_binary_payload_use_two_reads() {
+    fn short_data_prefix_metadata_and_binary_payload_use_one_read() {
         let mut observed = Vec::new();
         for compact in [false, true] {
             let size = if compact { 77 } else { 69 };
@@ -78,7 +78,202 @@ mod prefix_tests {
             assert_eq!(payload.as_slice(), b"F=\0\xffx");
             observed.push((compact, test_io::reads()));
         }
-        assert_eq!(observed, [(false, 2), (true, 2)]);
+        assert_eq!(observed, [(false, 1), (true, 1)]);
+    }
+
+    #[test]
+    fn data_sizes_around_prefix_boundary_preserve_bytes_without_rereading() {
+        for compact in [false, true] {
+            let header = if compact { 72 } else { 64 };
+            for size in [header + 5, 127, 128, 129, 512] {
+                let (_fixture, file, offset) = object(compact, OBJECT_DATA, size as u64, size);
+                let mut expected = vec![0; size - header];
+                expected[..5].copy_from_slice(b"F=\0\xffx");
+                if expected.len() > 5 {
+                    *expected.last_mut().unwrap() = 0xa5;
+                    OpenOptions::new()
+                        .write(true)
+                        .open(file.path())
+                        .unwrap()
+                        .write_all_at(&[0xa5], offset + size as u64 - 1)
+                        .unwrap();
+                }
+                test_io::reset();
+                let actual = file.read_data_payload_bytes_for_object(offset).unwrap();
+                assert_eq!(actual.as_slice(), expected);
+                assert_eq!(test_io::reads(), if size <= 128 { 1 } else { 2 });
+                assert_eq!(test_io::read_bytes(), size);
+            }
+        }
+    }
+
+    #[test]
+    fn physical_optional_tail_failure_preserves_required_diagnostics() {
+        for compact in [false, true] {
+            for (kind, size, expected) in [
+                (0, 16, "expected DATA"),
+                (OBJECT_DATA, 16, "too small"),
+                (OBJECT_DATA, 1 << 40, "limit"),
+            ] {
+                let (_fixture, mut file, offset) = object(compact, kind, size, 80);
+                Arc::get_mut(&mut file.inner).unwrap().used_size = offset + 256;
+                let error = file.read_data_payload_bytes_for_object(offset).unwrap_err();
+                if expected == "limit" {
+                    assert!(matches!(error, SdJournalError::LimitExceeded { .. }));
+                } else {
+                    assert!(
+                        matches!(&error, SdJournalError::Corrupt { reason, .. } if reason.contains(expected)),
+                        "{error:?}"
+                    );
+                }
+            }
+            let header = if compact { 72 } else { 64 };
+            let (_fixture, mut file, offset) =
+                object(compact, OBJECT_DATA, (header + 5) as u64, header + 5);
+            Arc::get_mut(&mut file.inner).unwrap().used_size = offset + 256;
+            let payload = file.read_data_payload_bytes_for_object(offset).unwrap();
+            assert_eq!(payload.as_slice(), b"F=\0\xffx");
+            assert!(matches!(
+                file.finish_snapshot_read(Ok(payload)),
+                Err(SdJournalError::Transient { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn optional_raw_fault_falls_back_once_but_required_fault_still_fails() {
+        for compact in [false, true] {
+            let size = if compact { 77 } else { 69 };
+            let (_fixture, file, offset) = object(compact, OBJECT_DATA, size, size as usize);
+            test_io::read_steps([Err(std::io::ErrorKind::Other)]);
+            let result = file.read_data_payload_bytes_for_object(offset);
+            test_io::read_steps([]);
+            assert_eq!(result.unwrap().as_slice(), b"F=\0\xffx");
+            test_io::read_steps([
+                Err(std::io::ErrorKind::Other),
+                Err(std::io::ErrorKind::PermissionDenied),
+            ]);
+            let result = file.read_data_payload_bytes_for_object(offset);
+            test_io::read_steps([]);
+            assert!(matches!(result, Err(SdJournalError::Io { .. })));
+        }
+    }
+
+    #[test]
+    fn data_prefix_handles_interrupted_and_short_progress_without_payload_changes() {
+        for compact in [false, true] {
+            let size = if compact { 77 } else { 69 };
+            let (_fixture, file, offset) = object(compact, OBJECT_DATA, size, size as usize);
+            test_io::read_steps([
+                Err(std::io::ErrorKind::Interrupted),
+                Ok(1),
+                Err(std::io::ErrorKind::Interrupted),
+                Ok(usize::MAX),
+            ]);
+            let result = file.read_data_payload_bytes_for_object(offset);
+            test_io::read_steps([]);
+            assert_eq!(result.unwrap().as_slice(), b"F=\0\xffx");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retirement_after_prefix_or_during_remainder_overrides_decode_result() {
+        for compact in [false, true] {
+            for size in [96, 512] {
+                let (_fixture, file, offset) = object(compact, OBJECT_DATA, size, size as usize);
+                let path = file.path().to_owned();
+                let owner = OpenOptions::new().write(true).open(&path).unwrap();
+                test_io::reset();
+                test_io::after_read(1, move || {
+                    std::fs::remove_file(path).unwrap();
+                    rustix::fs::fallocate(
+                        &owner,
+                        rustix::fs::FallocateFlags::PUNCH_HOLE
+                            | rustix::fs::FallocateFlags::KEEP_SIZE,
+                        0,
+                        owner.metadata().unwrap().len(),
+                    )
+                    .unwrap();
+                });
+                let decoded = file.read_data_payload_bytes_for_object(offset);
+                test_io::reset();
+                // The same real entry-publication guard applies whether the
+                // prefetched field succeeded or the remainder decoded zeroes.
+                assert!(matches!(
+                    file.finish_snapshot_read(decoded),
+                    Err(SdJournalError::Retired { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_corruption_and_decompression_errors_do_not_fall_back() {
+        for compact in [false, true] {
+            let (_fixture, file, offset) = object(compact, 0, 96, 160);
+            test_io::reset();
+            assert!(matches!(
+                file.read_data_payload_bytes_for_object(offset),
+                Err(SdJournalError::Corrupt { .. })
+            ));
+            assert_eq!(test_io::reads(), 1);
+            let (_fixture, file, offset) = object(compact, OBJECT_DATA, 96, 160);
+            OpenOptions::new()
+                .write(true)
+                .open(file.path())
+                .unwrap()
+                .write_all_at(&[1], offset + 1)
+                .unwrap();
+            test_io::reset();
+            assert!(file.read_data_payload_bytes_for_object(offset).is_err());
+            assert_eq!(test_io::reads(), 1);
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn short_checksums_are_validated_without_retrying_the_field() {
+        let frame = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x13, 0x99, 0x00, 0x00, 0x4d, 0x45, 0x53, 0x53, 0x41,
+            0x47, 0x45, 0x3d, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x73, 0x75, 0x6d, 0x6d, 0x65, 0x64,
+            0x65, 0x4f, 0xe7, 0xb0,
+        ];
+        for compact in [false, true] {
+            let header = if compact { 72 } else { 64 };
+            let (_fixture, mut file, offset) =
+                object(compact, OBJECT_DATA, (header + frame.len()) as u64, 160);
+            Arc::get_mut(&mut file.inner)
+                .unwrap()
+                .header
+                .incompatible_flags |= HEADER_INCOMPATIBLE_COMPRESSED_ZSTD;
+            let owner = OpenOptions::new().write(true).open(file.path()).unwrap();
+            owner.write_all_at(&[4], offset + 1).unwrap();
+            owner.write_all_at(&frame, offset + header as u64).unwrap();
+            test_io::reset();
+            assert_eq!(
+                file.read_data_payload_bytes_for_object(offset)
+                    .unwrap()
+                    .as_slice(),
+                b"MESSAGE=checksummed"
+            );
+            assert_eq!(test_io::reads(), 1);
+            owner
+                .write_all_at(
+                    &[frame[frame.len() - 1] ^ 1],
+                    offset + (header + frame.len() - 1) as u64,
+                )
+                .unwrap();
+            test_io::reset();
+            assert!(matches!(
+                file.read_data_payload_bytes_for_object(offset),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    ..
+                })
+            ));
+            assert_eq!(test_io::reads(), 1);
+        }
     }
 
     #[test]
@@ -149,6 +344,61 @@ pub(crate) struct DataObjectRef {
 
 impl JournalFile {
     pub(crate) fn read_data_payload_bytes_for_object(&self, data_offset: u64) -> Result<ByteBuf> {
+        // The enclosing entry transaction already owns and validates this FD.
+        // Other access kinds retain their original read path and map contract.
+        if let super::Access::File(access) = &self.inner.access {
+            self.validate_object_offset(data_offset)?;
+            let header_len = if self.inner.header.is_compact() {
+                72
+            } else {
+                64
+            };
+            let remaining = self.inner.used_size.saturating_sub(data_offset);
+            if remaining >= header_len as u64 {
+                let prefix_len = remaining.min(128) as usize;
+                let mut prefix = [0u8; 128];
+                // Optional adjacent bytes must not hide the old required-range
+                // diagnostics. Only a raw read failure takes this one fallback;
+                // parsed corruption and decompression errors return directly.
+                if crate::reader::read_exact_at(
+                    &access.file,
+                    data_offset,
+                    &mut prefix[..prefix_len],
+                )
+                .is_ok()
+                {
+                    let meta = self.parse_data_object_meta(data_offset, &prefix[..prefix_len])?;
+                    let object_len =
+                        usize::try_from(meta.size).map_err(|_| SdJournalError::LimitExceeded {
+                            kind: LimitKind::ObjectSizeBytes,
+                            limit: self.inner.config.max_object_size_bytes,
+                        })?;
+                    let payload = if object_len <= prefix_len {
+                        ByteBuf::Owned(std::sync::Arc::from(&prefix[header_len..object_len]))
+                    } else {
+                        let mut bytes = vec![0; object_len - header_len];
+                        let copied = prefix_len - header_len;
+                        bytes[..copied].copy_from_slice(&prefix[header_len..prefix_len]);
+                        let read_offset = checked_add_u64(
+                            data_offset,
+                            prefix_len as u64,
+                            "DATA remainder offset",
+                        )?;
+                        let read_len = bytes.len() - copied;
+                        crate::reader::read_exact_at(
+                            &access.file,
+                            read_offset,
+                            &mut bytes[copied..],
+                        )
+                        .map_err(|error| {
+                            crate::reader::read_failure(self.path(), read_offset, read_len, error)
+                        })?;
+                        ByteBuf::from_vec(bytes)
+                    };
+                    return self.decode_data_payload(data_offset, meta.flags, payload);
+                }
+            }
+        }
         let meta = self.read_data_object_meta(data_offset)?;
         self.read_data_payload_bytes(data_offset, &meta)
     }
@@ -325,7 +575,15 @@ impl JournalFile {
             16
         };
         let buf = self.read_bytes(offset, prefix_len)?;
-        let buf = buf.as_slice();
+        self.parse_data_object_meta(offset, buf.as_slice())
+    }
+
+    fn parse_data_object_meta(&self, offset: u64, buf: &[u8]) -> Result<DataObjectMeta> {
+        let min_size = if self.inner.header.is_compact() {
+            72u64
+        } else {
+            64u64
+        };
         let oh = ObjectHeader::parse(buf, self.path(), offset)?;
         if oh.object_type != OBJECT_DATA {
             return Err(SdJournalError::Corrupt {
@@ -458,8 +716,11 @@ impl JournalFile {
 
         let payload_offset = checked_add_u64(offset, payload_offset, "DATA payload offset")?;
         let payload = self.read_bytes(payload_offset, payload_len)?;
+        self.decode_data_payload(offset, meta.flags, payload)
+    }
 
-        let payload = match compression_from_object_flags(meta.flags)? {
+    fn decode_data_payload(&self, offset: u64, flags: u8, payload: ByteBuf) -> Result<ByteBuf> {
+        let payload = match compression_from_object_flags(flags)? {
             None => payload,
             Some(CompressionAlgo::Xz) => {
                 if self.inner.header.incompatible_flags & HEADER_INCOMPATIBLE_COMPRESSED_XZ == 0 {

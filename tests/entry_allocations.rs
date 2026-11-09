@@ -104,3 +104,44 @@ fn mmap_entry_walk_owns_each_payload_with_one_allocation_without_regrowth() {
         synthetic_message(7, 0, units[0]).as_bytes()
     );
 }
+
+#[test]
+fn descriptor_entry_walk_bounds_short_field_allocations_without_regrowth() {
+    let units = vec!["alpha.service"; 64];
+    let fixture = SyntheticJournalFile::new(&units);
+    let journal = sdjournal::Journal::open_dir_with_config(
+        fixture.root(),
+        sdjournal::JournalConfig {
+            mmap_policy: sdjournal::MmapPolicy::Never,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut entries = journal.query().iter().unwrap();
+    let mut minimum_allocations = usize::MAX;
+    let mut maximum_allocations = 0;
+    for (index, unit) in units.iter().enumerate() {
+        COUNT.with(|count| count.set(Some((0, 0))));
+        let result = entries.next();
+        let observed = COUNT.with(|count| count.replace(None).unwrap());
+        minimum_allocations = minimum_allocations.min(observed.0);
+        maximum_allocations = maximum_allocations.max(observed.0);
+        let entry = result.unwrap().unwrap();
+        assert!(
+            observed.0 <= 7 + entry.iter_fields().count(),
+            "entry{index}: {observed:?}"
+        );
+        assert_eq!(observed.1, 0);
+        assert_eq!(
+            entry.get("MESSAGE").unwrap(),
+            synthetic_message(7, index, unit).as_bytes()
+        );
+    }
+    assert!(entries.next().is_none());
+    println!(
+        "descriptor allocation measurement: entries={}, minimum={}, maximum={}, reallocations=0",
+        units.len(),
+        minimum_allocations,
+        maximum_allocations
+    );
+}
