@@ -8,8 +8,10 @@ use std::{
     path::Path,
 };
 
-use sdjournal::{Journal, JournalConfig, MmapPolicy};
-use support::synthetic_journal::write_synthetic_journal_file;
+use sdjournal::{Cursor, Journal, JournalConfig, MmapPolicy, SdJournalError};
+use support::synthetic_journal::{
+    SyntheticJournalFile, synthetic_message, write_synthetic_journal_file,
+};
 
 fn retire(path: &Path, unlink: bool) {
     let file = OpenOptions::new()
@@ -380,4 +382,99 @@ fn excluded_files_do_not_bypass_the_discovery_file_limit() {
             ..
         })
     ));
+}
+
+const UNITS: [&str; 3] = ["first.service", "second.service", "third.service"];
+
+fn poisoned_fixture(
+    entry_index: usize,
+    max_open_files: usize,
+) -> (SyntheticJournalFile, Journal, Vec<Cursor>) {
+    let layout = SyntheticJournalFile::new(&UNITS);
+    let config = JournalConfig {
+        mmap_policy: MmapPolicy::Never,
+        max_open_files,
+        ..Default::default()
+    };
+    let cursors = {
+        let original = Journal::open_dir_with_config(layout.root(), config.clone()).unwrap();
+        original
+            .query()
+            .collect_owned()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.cursor().unwrap())
+            .collect()
+    };
+    let path = layout.root().join("synthetic.journal");
+    let mut bytes = fs::read(&path).unwrap();
+    let payload = format!(
+        "MESSAGE={}",
+        synthetic_message(7, entry_index, UNITS[entry_index])
+    );
+    let matches: Vec<_> = bytes
+        .windows(payload.len())
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == payload.as_bytes()).then_some(index))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "fixture has one unique MESSAGE DATA payload"
+    );
+    let data_offset = matches[0].checked_sub(64).unwrap();
+    assert_eq!(bytes[data_offset], 1, "the actual regular DATA object");
+    assert_eq!(
+        u64::from_le_bytes(bytes[data_offset + 8..data_offset + 16].try_into().unwrap()),
+        u64::try_from(64 + payload.len()).unwrap()
+    );
+    // Poison only DATA type: every ENTRY header, array offset and saved cursor
+    // stays valid. Fresh opening avoids any decoded payload retained by setup.
+    bytes[data_offset] = 0;
+    fs::write(&path, bytes).unwrap();
+    let journal = Journal::open_dir_with_config(layout.root(), config).unwrap();
+    (layout, journal, cursors)
+}
+
+#[test]
+fn valid_cursor_skips_consumed_data_for_empty_and_suffix_queries() {
+    for budget in [1, 64] {
+        let (_layout, journal, cursors) = poisoned_fixture(0, budget);
+        assert!(
+            matches!(
+                journal.query().collect_owned(),
+                Err(SdJournalError::Corrupt { .. })
+            ),
+            "head must actually decode and reject the poisoned consumed DATA"
+        );
+
+        let mut tail = journal.query();
+        tail.after_cursor(cursors[2].clone());
+        assert!(tail.collect_owned().unwrap().is_empty());
+
+        let mut suffix = journal.query();
+        suffix.after_cursor(cursors[0].clone());
+        let entries = suffix.collect_owned().unwrap();
+        assert_eq!(entries.len(), 2);
+        for (entry, index) in entries.iter().zip(1..3) {
+            assert_eq!(
+                entry.get("MESSAGE").unwrap(),
+                synthetic_message(7, index, UNITS[index]).as_bytes()
+            );
+            assert_eq!(entry.cursor().unwrap(), cursors[index]);
+        }
+    }
+}
+
+#[test]
+fn valid_cursor_does_not_hide_corrupt_unread_data() {
+    for budget in [1, 64] {
+        let (_layout, journal, cursors) = poisoned_fixture(1, budget);
+        let mut suffix = journal.query();
+        suffix.after_cursor(cursors[0].clone());
+        assert!(matches!(
+            suffix.collect_owned(),
+            Err(SdJournalError::Corrupt { .. })
+        ));
+    }
 }
