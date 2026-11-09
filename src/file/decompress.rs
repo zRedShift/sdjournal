@@ -424,23 +424,39 @@ mod tests {
     #[test]
     fn zstd_rejects_invalid_checksums_in_every_frame() {
         let plain = b"MESSAGE=checksummed";
-        let valid = zstd_fixture(plain);
+        // Fixed libzstd frame with checksumFlag=1. Do not generate it using
+        // ruzstd: its encoder omits checksums when the hash feature is off,
+        // which would make the baseline test fail before exercising decoding.
+        let valid = vec![
+            0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x13, 0x99, 0x00, 0x00, 0x4d, 0x45, 0x53, 0x53, 0x41,
+            0x47, 0x45, 0x3d, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x73, 0x75, 0x6d, 0x6d, 0x65, 0x64,
+            0x65, 0x4f, 0xe7, 0xb0,
+        ];
         assert_ne!(valid[4] & 4, 0, "fixture must include a content checksum");
         assert_eq!(decompress_zstd(&valid, 128).unwrap(), plain);
 
         let mut corrupt = valid.clone();
         *corrupt.last_mut().unwrap() ^= 1;
+        let mut rejected = Vec::new();
         for prefix in [Vec::new(), valid] {
+            let prefix_len = prefix.len();
             let mut encoded = prefix;
             encoded.extend_from_slice(&corrupt);
-            assert!(matches!(
-                decompress_zstd(&encoded, 128),
-                Err(SdJournalError::DecompressFailed {
-                    algo: CompressionAlgo::Zstd,
-                    ..
-                })
+            rejected.push((
+                prefix_len,
+                matches!(
+                    decompress_zstd(&encoded, 128),
+                    Err(SdJournalError::DecompressFailed {
+                        algo: CompressionAlgo::Zstd,
+                        ..
+                    })
+                ),
             ));
         }
+        assert!(
+            rejected.iter().all(|(_, rejected)| *rejected),
+            "{rejected:?}"
+        );
     }
 
     #[cfg(feature = "zstd")]
