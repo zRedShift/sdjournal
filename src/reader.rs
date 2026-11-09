@@ -41,6 +41,8 @@ pub(crate) mod test_io {
     thread_local! {
         static OPENS: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
         static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        #[cfg(unix)]
+        static READ_STEPS: RefCell<std::collections::VecDeque<std::result::Result<usize, std::io::ErrorKind>>> = const { RefCell::new(std::collections::VecDeque::new()) };
         static OBSERVED: RefCell<Option<(PathBuf, (usize, usize))>> = const { RefCell::new(None) };
     }
     pub(crate) fn opened(path: &Path) {
@@ -56,6 +58,27 @@ pub(crate) mod test_io {
     }
     pub(crate) fn reads() -> usize {
         READS.with(std::cell::Cell::get)
+    }
+    #[cfg(unix)]
+    pub(crate) fn read_at(
+        file: &std::fs::File,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt as _;
+        let limit = match READ_STEPS.with(|steps| steps.borrow_mut().pop_front()) {
+            Some(Err(kind)) => return Err(std::io::Error::from(kind)),
+            Some(Ok(limit)) => limit.min(buf.len()),
+            None => buf.len(),
+        };
+        read_call();
+        file.read_at(&mut buf[..limit], offset)
+    }
+    #[cfg(unix)]
+    pub(crate) fn read_steps(
+        steps: impl IntoIterator<Item = std::result::Result<usize, std::io::ErrorKind>>,
+    ) {
+        READ_STEPS.with(|slot| *slot.borrow_mut() = steps.into_iter().collect());
     }
     pub(crate) fn opens(path: &Path) -> usize {
         OPENS.with(|counts| counts.borrow().get(path).copied().unwrap_or(0))
@@ -329,10 +352,12 @@ pub(crate) fn read_exact_at(
     mut offset: u64,
     mut buf: &mut [u8],
 ) -> std::io::Result<()> {
+    #[cfg(not(test))]
     use std::os::unix::fs::FileExt as _;
     while !buf.is_empty() {
         #[cfg(test)]
-        test_io::read_call();
+        let n = test_io::read_at(file, buf, offset)?;
+        #[cfg(not(test))]
         let n = file.read_at(buf, offset)?;
         if n == 0 {
             return Err(std::io::Error::new(
@@ -400,6 +425,43 @@ mod tests {
         let buf = ByteBuf::from_vec(vec![1, 2, 3, 4]);
         assert_eq!(buf.as_slice(), &[1, 2, 3, 4]);
         assert_eq!(buf.as_ref(), &[1, 2, 3, 4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_read_retries_interruption_without_losing_partial_progress() {
+        use std::io::ErrorKind::Interrupted;
+        let (_root, _path, file) = temp_file(b"abcdef");
+        test_io::read_steps([
+            Err(Interrupted),
+            Ok(2),
+            Err(Interrupted),
+            Err(Interrupted),
+            Ok(usize::MAX),
+        ]);
+        let mut bytes = [0; 6];
+        let result = read_exact_at(&file, 0, &mut bytes);
+        test_io::read_steps([]);
+        result.unwrap();
+        assert_eq!(&bytes, b"abcdef");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_read_does_not_retry_eof_or_unrelated_errors() {
+        let (_root, _path, file) = temp_file(b"abc");
+        let mut bytes = [0; 6];
+        assert_eq!(
+            read_exact_at(&file, 0, &mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        test_io::read_steps([Err(std::io::ErrorKind::PermissionDenied)]);
+        let result = read_exact_at(&file, 0, &mut bytes);
+        test_io::read_steps([]);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

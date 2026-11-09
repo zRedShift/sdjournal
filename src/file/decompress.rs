@@ -368,6 +368,84 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn lz4_rejects_a_block_shorter_than_its_advertised_size() {
+        let plain = b"MESSAGE=truncated";
+        let mut encoded = ((plain.len() + 1) as u64).to_le_bytes().to_vec();
+        encoded.extend_from_slice(&lz4_flex::block::compress(plain));
+        assert!(matches!(
+            decompress_lz4(&encoded, 128),
+            Err(SdJournalError::DecompressFailed {
+                algo: CompressionAlgo::Lz4,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_rejects_invalid_checksums_in_every_frame() {
+        let plain = b"MESSAGE=checksummed";
+        let valid = zstd_fixture(plain);
+        assert_ne!(valid[4] & 4, 0, "fixture must include a content checksum");
+        assert_eq!(decompress_zstd(&valid, 128).unwrap(), plain);
+
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        for prefix in [Vec::new(), valid] {
+            let mut encoded = prefix;
+            encoded.extend_from_slice(&corrupt);
+            assert!(matches!(
+                decompress_zstd(&encoded, 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_validates_declared_content_size_for_every_frame() {
+        for prefix in [Vec::new(), zstd_fixture(b"first")] {
+            for declared_size in [0, 4, 6] {
+                let mut encoded = prefix.clone();
+                // A single-segment frame declaring a different size from its five-byte raw block.
+                encoded.extend_from_slice(&[
+                    0x28,
+                    0xb5,
+                    0x2f,
+                    0xfd,
+                    0x20,
+                    declared_size,
+                    0x29,
+                    0,
+                    0,
+                ]);
+                encoded.extend_from_slice(b"hello");
+                assert!(
+                    matches!(
+                        decompress_zstd(&encoded, 128),
+                        Err(SdJournalError::DecompressFailed {
+                            algo: CompressionAlgo::Zstd,
+                            ..
+                        })
+                    ),
+                    "accepted invalid declared size {declared_size}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_accepts_a_frame_with_an_explicit_zero_content_size() {
+        let encoded = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0, 1, 0, 0];
+        assert!(decompress_zstd(&encoded, 0).unwrap().is_empty());
+    }
+
     #[cfg(feature = "zstd")]
     #[test]
     fn zstd_decodes_concatenated_frames_and_skips_metadata_frames() {
