@@ -176,12 +176,11 @@ pub struct EntryRef {
 }
 
 impl EntryRef {
-    /// Cached entry transactions must not lend their map beyond the cache lock.
-    #[cfg(unix)]
+    /// Published entries must not lend mutable file mappings to their callers.
     pub(crate) fn into_owned_payloads(mut self) -> Self {
         for field in &mut self.fields_in_order {
             if !matches!(field.payload, ByteBuf::Owned(_)) {
-                field.payload = ByteBuf::from_vec(field.payload.as_slice().to_vec());
+                field.payload = ByteBuf::Owned(Arc::from(field.payload.as_slice()));
             }
         }
         self

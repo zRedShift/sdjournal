@@ -1,10 +1,12 @@
 mod support;
 
-use sdjournal::SdJournalError;
-use sdjournal::{Cursor, Journal, MmapPolicy};
-use std::fs;
-use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    io::{Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+use sdjournal::{Cursor, Journal, MmapPolicy, SdJournalError};
 use support::synthetic_journal::{
     SyntheticJournalFile, synthetic_message, synthetic_realtime_usec, write_synthetic_journal_file,
 };
@@ -251,7 +253,10 @@ fn low_memory_query_reports_a_missing_file_instead_of_using_unsafe_time_pruning(
     query.since_realtime(synthetic_realtime_usec(9, 0));
     assert!(matches!(
         query.collect_owned(),
-        Err(SdJournalError::Io { op: "open", .. })
+        Err(SdJournalError::Retired {
+            reason: sdjournal::RetirementReason::Disappeared,
+            ..
+        })
     ));
 }
 
@@ -284,7 +289,10 @@ fn low_memory_query_reports_a_missing_file_after_cursor() {
     resumed.after_cursor(cursor);
     assert!(matches!(
         resumed.collect_owned(),
-        Err(SdJournalError::Io { op: "open", .. })
+        Err(SdJournalError::Retired {
+            reason: sdjournal::RetirementReason::Disappeared,
+            ..
+        })
     ));
 }
 
@@ -371,8 +379,10 @@ fn lazy_reopen_rejects_a_replaced_journal_file() {
 
     assert!(matches!(
         journal.query().collect_owned(),
-        Err(SdJournalError::Transient { reason, .. })
-            if reason == "journal file was replaced after discovery"
+        Err(SdJournalError::Retired {
+            reason: sdjournal::RetirementReason::Replaced,
+            ..
+        })
     ));
 }
 

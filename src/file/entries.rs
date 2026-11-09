@@ -1,11 +1,25 @@
-use super::JournalFile;
-use crate::cursor::SdJournalEntryKey;
-use crate::entry::EntryRef;
-use crate::error::{LimitKind, Result, SdJournalError};
-use crate::format::{OBJECT_ENTRY, ObjectHeader, parse_entry_data_offsets_bytes};
-use crate::util::{is_ascii_field_name, read_id128, read_u64_le};
+use super::{EntryMeta, JournalFile};
+use crate::{
+    cursor::SdJournalEntryKey,
+    entry::EntryRef,
+    error::{LimitKind, Result, SdJournalError},
+    format::{OBJECT_ENTRY, ObjectHeader, parse_entry_data_offsets_bytes},
+    util::{is_ascii_field_name, read_id128, read_u64_le},
+};
 
-use super::EntryMeta;
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn publication_hook() {
+    PUBLICATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ParsedEntryHeader {
@@ -19,6 +33,12 @@ struct ParsedEntryHeader {
 
 impl JournalFile {
     pub(crate) fn read_entry_meta(&self, entry_offset: u64) -> Result<EntryMeta> {
+        self.validate_snapshot()?;
+        let result = self.read_entry_meta_inner(entry_offset);
+        self.finish_snapshot_read(result)
+    }
+
+    fn read_entry_meta_inner(&self, entry_offset: u64) -> Result<EntryMeta> {
         let parsed = self.read_entry_header(entry_offset)?;
 
         Ok(EntryMeta {
@@ -38,7 +58,13 @@ impl JournalFile {
         if let super::Access::Cached(access) = &self.inner.access {
             return access.read_entry(self, entry_offset);
         }
-        self.read_entry_ref_inner(entry_offset)
+        self.validate_snapshot()?;
+        let result = self
+            .read_entry_ref_inner(entry_offset)
+            .map(EntryRef::into_owned_payloads);
+        #[cfg(test)]
+        publication_hook();
+        self.finish_snapshot_read(result)
     }
 
     pub(super) fn read_entry_ref_inner(&self, entry_offset: u64) -> Result<EntryRef> {
@@ -225,5 +251,120 @@ impl JournalFile {
             reason: "DATA field name is not valid UTF-8".to_string(),
         })?;
         Ok((name, eq))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod retirement_tests {
+    use std::{fs, os::unix::fs::FileExt as _};
+
+    use super::*;
+    use crate::{Journal, JournalConfig, MmapPolicy, RetirementReason};
+    #[allow(dead_code)]
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/synthetic_journal.rs"
+        ));
+    }
+
+    #[test]
+    fn retirement_between_owned_copy_and_publication_is_refused_for_all_accesses() {
+        for budget in [1, 64] {
+            for policy in [MmapPolicy::Auto, MmapPolicy::Never] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("a.journal");
+                fixture::write_synthetic_journal_file(&path, &["a.service"], 7);
+                fixture::write_synthetic_journal_file(
+                    &root.path().join("b.journal"),
+                    &["b.service"],
+                    8,
+                );
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all_at(&[2], 16)
+                    .unwrap();
+                let journal = Journal::open_dir_with_config(
+                    root.path(),
+                    JournalConfig {
+                        max_open_files: budget,
+                        mmap_policy: policy,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut iter = journal.query().iter().unwrap();
+                PUBLICATION_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+                        fs::remove_file(&path).unwrap();
+                        rustix::fs::fallocate(
+                            &file,
+                            rustix::fs::FallocateFlags::PUNCH_HOLE
+                                | rustix::fs::FallocateFlags::KEEP_SIZE,
+                            0,
+                            file.metadata().unwrap().len(),
+                        )
+                        .unwrap();
+                    }))
+                });
+                assert!(matches!(
+                    iter.next().unwrap(),
+                    Err(SdJournalError::Retired {
+                        reason: RetirementReason::Unlinked,
+                        ..
+                    }) | Err(SdJournalError::Retired {
+                        reason: RetirementReason::Disappeared,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn post_error_retirement_overrides_zero_decode_but_linked_corruption_survives() {
+        for budget in [1, 64] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("a.journal");
+            fixture::write_synthetic_journal_file(&path, &["a.service"], 7);
+            fixture::write_synthetic_journal_file(
+                &root.path().join("b.journal"),
+                &["b.service"],
+                8,
+            );
+            let journal = Journal::open_dir_with_config(
+                root.path(),
+                JournalConfig {
+                    max_open_files: budget,
+                    mmap_policy: MmapPolicy::Never,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let file = journal.inner.open_file_by_index(0).unwrap();
+            let offset = file.inner.header.tail_entry_offset.unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .write_all_at(&[0], offset)
+                .unwrap();
+            assert!(matches!(
+                file.read_entry_ref(offset),
+                Err(SdJournalError::Corrupt { .. })
+            ));
+            PUBLICATION_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::remove_file(path).unwrap();
+                }))
+            });
+            assert!(matches!(
+                file.read_entry_ref(offset),
+                Err(SdJournalError::Retired { .. })
+            ));
+        }
     }
 }

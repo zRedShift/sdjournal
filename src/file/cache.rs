@@ -1,15 +1,16 @@
 //! Lazy snapshots share a bounded reader cache, not per-field file opens.
-use super::{Access, JournalFile};
-use crate::{
-    config::JournalConfig,
-    error::{Result, SdJournalError},
-    reader::{ByteBuf, FileAccess},
-};
 use std::{
     collections::VecDeque,
     fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+};
+
+use super::{Access, JournalFile};
+use crate::{
+    config::JournalConfig,
+    error::{Result, SdJournalError},
+    reader::{ByteBuf, FileAccess},
 };
 
 #[cfg(test)]
@@ -50,7 +51,12 @@ fn transient(path: &Path, reason: &str) -> SdJournalError {
 }
 
 fn open_error(path: &Path, error: std::io::Error) -> SdJournalError {
-    if error.kind() == std::io::ErrorKind::PermissionDenied {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SdJournalError::Retired {
+            path: path.to_owned(),
+            reason: crate::RetirementReason::Disappeared,
+        }
+    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
         SdJournalError::PermissionDenied {
             path: path.to_owned(),
         }
@@ -100,10 +106,10 @@ impl ReaderCache {
             false,
         )?;
         if snapshot.file_id() != file_id || snapshot.seqnum_id() != seqnum_id {
-            return Err(transient(
-                &path,
-                "journal file was replaced after discovery",
-            ));
+            return Err(SdJournalError::Retired {
+                path,
+                reason: crate::RetirementReason::Replaced,
+            });
         }
         reader.access = snapshot.inner.access.clone();
         reader.mapped_len = snapshot.inner.file_len;
@@ -155,21 +161,36 @@ impl CachedReader {
         #[cfg(test)]
         VALIDATIONS.with(|count| count.set(count.get() + 1));
         use std::os::unix::fs::MetadataExt as _;
+        crate::reader::check_file_owner(&self.file, path, 0)?;
         let metadata = std::fs::metadata(path).map_err(|error| open_error(path, error))?;
         if (metadata.dev(), metadata.ino()) != self.identity
             || identity.is_some_and(|id| id != self.identity)
         {
-            return Err(transient(path, "journal file was replaced after discovery"));
+            return Err(SdJournalError::Retired {
+                path: path.to_owned(),
+                reason: crate::RetirementReason::Replaced,
+            });
         }
         let mut header = [0u8; 88];
         crate::reader::read_exact_at(self.file.as_ref(), 0, &mut header)
             .map_err(|error| crate::reader::read_failure(path, 0, header.len(), error))?;
+        if &header[..8] != crate::format::HEADER_SIGNATURE {
+            // A linked zeroed/corrupt header is not evidence of replacement.
+            return Err(SdJournalError::Corrupt {
+                path: Some(path.to_owned()),
+                offset: Some(0),
+                reason: "invalid journal header signature".to_owned(),
+            });
+        }
         if self.file_id != file_id
             || self.seqnum_id != seqnum_id
             || header[24..40] != file_id
             || header[72..88] != seqnum_id
         {
-            return Err(transient(path, "journal file was replaced after discovery"));
+            return Err(SdJournalError::Retired {
+                path: path.to_owned(),
+                reason: crate::RetirementReason::Replaced,
+            });
         }
         let state = header[16];
         if state > crate::format::STATE_ARCHIVED {
@@ -250,6 +271,21 @@ impl CachedReader {
 }
 
 impl CachedAccess {
+    pub(super) fn validate_snapshot(&self, minimum_len: u64) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata =
+            std::fs::metadata(&self.path).map_err(|error| open_error(&self.path, error))?;
+        if (metadata.dev(), metadata.ino()) != self.identity {
+            return Err(SdJournalError::Retired {
+                path: self.path.clone(),
+                reason: crate::RetirementReason::Replaced,
+            });
+        }
+        if metadata.len() < minimum_len {
+            return Err(transient(&self.path, "file was truncated while reading"));
+        }
+        Ok(())
+    }
     pub(super) fn read_entry(
         &self,
         snapshot: &JournalFile,
@@ -269,6 +305,7 @@ impl CachedAccess {
                 if entries.len() == self.cache.config.max_open_files {
                     drop(entries.pop_front());
                 }
+                self.validate_snapshot(snapshot.inner.used_size)?;
                 CachedReader::open(self.path.clone(), &self.cache.config)?
             };
         let result = (|| {
@@ -295,14 +332,21 @@ impl CachedAccess {
                     hook();
                 }
             });
-            // Preserve the primary decoder/read error instead of masking it.
-            let entry = decoded?;
-            let (final_state, final_len) = reader.validate(
+            #[cfg(test)]
+            super::entries::publication_hook();
+            // A retired owner may explain zeroes/EOF from an already running
+            // decode. Only this positive evidence overrides its primary error.
+            let validation = reader.validate(
                 &self.path,
                 Some(self.identity),
                 self.file_id,
                 self.seqnum_id,
-            )?;
+            );
+            let (entry, (final_state, final_len)) = match (decoded, validation) {
+                (_, Err(error @ SdJournalError::Retired { .. })) => return Err(error),
+                (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+                (Ok(entry), Ok(validation)) => (entry, validation),
+            };
             if final_state != state || final_len < file_len {
                 return Err(transient(&self.path, "journal changed during entry read"));
             }
@@ -341,8 +385,9 @@ impl CachedAccess {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::unix::fs::FileExt as _;
+
+    use super::*;
     #[allow(dead_code)]
     mod fixture {
         include!(concat!(
@@ -542,8 +587,8 @@ mod tests {
         }
         assert_eq!(
             VALIDATIONS.with(std::cell::Cell::get),
-            1,
-            "no post-parse error masking"
+            2,
+            "post-parse retirement check preserves a linked primary error"
         );
         assert!(cache.entries.lock().unwrap().is_empty());
     }

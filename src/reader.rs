@@ -1,9 +1,35 @@
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use crate::error::{Result, SdJournalError};
 #[cfg(test)]
 use crate::util::checked_add_u64;
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+
+pub(crate) fn check_file_owner(file: &File, path: &Path, minimum_len: u64) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| SdJournalError::io("metadata", Some(path.to_owned()), error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() == 0 {
+            return Err(SdJournalError::Retired {
+                path: path.to_owned(),
+                reason: crate::RetirementReason::Unlinked,
+            });
+        }
+    }
+    if metadata.len() < minimum_len {
+        return Err(SdJournalError::Transient {
+            path: Some(path.to_owned()),
+            reason: "file was truncated while reading".to_owned(),
+        });
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 pub(crate) mod test_io {
@@ -114,7 +140,7 @@ impl AsRef<[u8]> for ByteBuf {
 #[derive(Clone)]
 pub(crate) struct FileAccess {
     path: PathBuf,
-    file: Arc<File>,
+    pub(super) file: Arc<File>,
 }
 
 impl FileAccess {
@@ -237,8 +263,7 @@ pub(crate) fn read_failure(
 #[derive(Clone)]
 pub(crate) struct MmapAccess {
     path: PathBuf,
-    #[cfg(test)]
-    file: Arc<File>,
+    pub(super) file: Arc<File>,
     map: Arc<Mmap>,
 }
 
@@ -247,14 +272,7 @@ impl MmapAccess {
     pub(crate) fn new(path: PathBuf, file: Arc<File>, map: Arc<Mmap>) -> Self {
         #[cfg(test)]
         test_io::observed(&path);
-        #[cfg(not(test))]
-        let _ = file;
-        Self {
-            path,
-            #[cfg(test)]
-            file,
-            map,
-        }
+        Self { path, file, map }
     }
 
     pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
@@ -349,9 +367,11 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write as _;
+
     use tempfile::tempdir;
+
+    use super::*;
 
     fn temp_file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, Arc<File>) {
         let dir = tempdir().unwrap();

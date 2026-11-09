@@ -1329,7 +1329,8 @@ fn send_live_item(
 fn is_skippable_live_file_error(err: &SdJournalError) -> bool {
     matches!(
         err,
-        SdJournalError::Corrupt { .. }
+        SdJournalError::Retired { .. }
+            | SdJournalError::Corrupt { .. }
             | SdJournalError::Transient { .. }
             | SdJournalError::Io { .. }
             | SdJournalError::LimitExceeded {

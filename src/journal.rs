@@ -1,16 +1,21 @@
-use crate::config::JournalConfig;
-use crate::cursor::Cursor;
-use crate::error::{LimitKind, Result, SdJournalError};
-use crate::file::{EntryRange, JournalFile};
-use crate::live::LiveJournal;
-use crate::query::JournalQuery;
-use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, warn};
+
+use crate::{
+    config::JournalConfig,
+    cursor::Cursor,
+    error::{LimitKind, Result, SdJournalError},
+    file::{EntryRange, JournalFile},
+    live::LiveJournal,
+    query::JournalQuery,
+};
 
 /// An opened set of journal files.
 ///
@@ -36,6 +41,9 @@ pub(crate) struct JournalFileInfo {
     pub(crate) entry_range: Option<EntryRange>,
     pub(crate) entry_range_known: bool,
     file: Option<JournalFile>,
+    used_size: u64,
+    #[cfg(unix)]
+    file_identity: (u64, u64),
 }
 
 pub(crate) struct JournalDiscovery {
@@ -181,6 +189,35 @@ pub(crate) struct JournalFileSet {
 }
 
 impl JournalInner {
+    pub(crate) fn validate_snapshot_owners(&self) -> Result<()> {
+        for info in &self.file_infos {
+            if let Some(file) = &info.file {
+                file.validate_snapshot()?;
+            } else {
+                let metadata = std::fs::metadata(&info.path)
+                    .map_err(|error| crate::file::snapshot_open_error(&info.path, error))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    if (metadata.dev(), metadata.ino()) != info.file_identity {
+                        return Err(SdJournalError::Retired {
+                            path: info.path.clone(),
+                            reason: crate::RetirementReason::Replaced,
+                        });
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = &metadata;
+                if metadata.len() < info.used_size {
+                    return Err(SdJournalError::Transient {
+                        path: Some(info.path.clone()),
+                        reason: "file was truncated while reading".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn is_lazy(&self) -> bool {
         self.file_infos.iter().any(|info| info.file.is_none())
     }
@@ -233,6 +270,9 @@ impl JournalInner {
 
 impl JournalFileInfo {
     fn from_open_file(file: JournalFile, keep_open: bool) -> Self {
+        let used_size = file.live_state().used_size;
+        #[cfg(unix)]
+        let file_identity = file.file_identity();
         let path = file.path().to_path_buf();
         let file_id = file.file_id();
         let seqnum_id = file.seqnum_id();
@@ -247,6 +287,9 @@ impl JournalFileInfo {
             entry_range,
             entry_range_known,
             file: keep_open.then_some(file),
+            used_size,
+            #[cfg(unix)]
+            file_identity,
         }
     }
 }
@@ -308,6 +351,7 @@ fn open_eager_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jo
                     file_infos.push(info);
                 }
             }
+            Err(e @ SdJournalError::Retired { .. }) => return Err(e),
             Err(e) => {
                 #[cfg(feature = "tracing")]
                 warn!(error = %e, "failed to open journal file");
@@ -339,6 +383,7 @@ fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jou
                     file_infos.push(info);
                 }
             }
+            Err(e @ SdJournalError::Retired { .. }) => return Err(e),
             Err(e) => {
                 #[cfg(feature = "tracing")]
                 warn!(error = %e, "failed to validate journal file for lazy open");
@@ -482,9 +527,11 @@ fn is_journal_file(path: &Path, config: &JournalConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs::{self, File};
+
     use tempfile::tempdir;
+
+    use super::*;
 
     #[allow(dead_code)]
     mod fixture {

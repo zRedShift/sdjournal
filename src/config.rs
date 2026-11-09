@@ -8,12 +8,18 @@ pub enum MmapPolicy {
     ///
     /// Online files are still read through file I/O unless
     /// [`JournalConfig::allow_mmap_online`] is also enabled.
+    /// The caller must ensure mapped files are not concurrently truncated.
+    /// Header state alone cannot guarantee this: vacuum may deallocate an
+    /// archived file still held by a reader. Use Never for system journal roots
+    /// subject to rotation/vacuum; metadata checks cannot prevent mmap SIGBUS.
     Auto,
 
     /// Never mmap journal files.
     ///
     /// Use this for processes with strict virtual-memory limits or deployments where mapping a
-    /// large archived journal file is undesirable.
+    /// large archived journal file is undesirable, or files may be concurrently
+    /// truncated/deallocated by journal vacuum. Reads and returned payloads use
+    /// owned buffers.
     Never,
 }
 

@@ -1,12 +1,17 @@
-use super::cursor::{CursorStart, build_cursor_start, entry_key_from_meta};
-use super::{JournalQuery, MatchTerm, build_branches, entry_ref_matches_query};
-use crate::cursor::{compare_entry_keys, same_entry};
-use crate::entry::EntryRef;
-use crate::error::{Result, SdJournalError};
-use crate::file::{DataEntryOffsetIter, EntryMeta, FileEntryIter, JournalFile};
-use crate::journal::JournalFileInfo;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::{cmp::Reverse, collections::BinaryHeap};
+
+use super::{
+    JournalQuery, MatchTerm, build_branches,
+    cursor::{CursorStart, build_cursor_start, entry_key_from_meta},
+    entry_ref_matches_query,
+};
+use crate::{
+    cursor::{compare_entry_keys, same_entry},
+    entry::EntryRef,
+    error::{Result, SdJournalError},
+    file::{DataEntryOffsetIter, EntryMeta, FileEntryIter, JournalFile},
+    journal::JournalFileInfo,
+};
 
 enum FileMetaIter {
     Empty,
@@ -728,7 +733,26 @@ fn info_may_match_query(info: &JournalFileInfo) -> bool {
 }
 
 impl EagerJournalIter {
+    fn validate_files(&self) -> Result<()> {
+        // Empty snapshots also participate: otherwise a retirement can turn
+        // into a clean query(false) without touching an entry iterator.
+        self.query.journal.inner.validate_snapshot_owners()
+    }
     fn new(query: JournalQuery) -> Result<Self> {
+        if matches!(query.limit, Some(0)) {
+            return Self::new_inner(query);
+        }
+        query.journal.inner.validate_snapshot_owners()?;
+        let journal = query.journal.clone();
+        let result = Self::new_inner(query);
+        match (result, journal.inner.validate_snapshot_owners()) {
+            (_, Err(error @ SdJournalError::Retired { .. })) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (result, _) => result,
+        }
+    }
+
+    fn new_inner(query: JournalQuery) -> Result<Self> {
         if matches!(query.limit, Some(0)) {
             return Ok(Self {
                 query,
@@ -898,6 +922,10 @@ impl Iterator for EagerJournalIter {
         }
 
         if let Some(err) = self.pending_error.take() {
+            // Construction errors can have been caused by vacuum after opening.
+            if let Err(retired @ SdJournalError::Retired { .. }) = self.validate_files() {
+                return Some(Err(retired));
+            }
             return Some(Err(err));
         }
 
@@ -913,7 +941,7 @@ impl Iterator for EagerJournalIter {
                 Some(item) => item,
                 None => {
                     self.done = true;
-                    return None;
+                    return self.validate_files().err().map(Err);
                 }
             };
 

@@ -55,7 +55,7 @@ unsafe impl GlobalAlloc for CountedSystem {
 static ALLOCATOR: CountedSystem = CountedSystem;
 
 #[test]
-fn mmap_entry_walk_uses_one_metadata_allocation_without_regrowth() {
+fn mmap_entry_walk_owns_each_payload_with_one_allocation_without_regrowth() {
     let units = vec!["alpha.service"; 64];
     let fixture = SyntheticJournalFile::new(&units);
     fixture.rewrite(&units);
@@ -78,8 +78,8 @@ fn mmap_entry_walk_uses_one_metadata_allocation_without_regrowth() {
         let entry = item.unwrap().unwrap();
         assert_eq!(
             observed,
-            (1, 0),
-            "entry {index} metadata allocation/reallocation"
+            (1 + entry.iter_fields().count(), 0),
+            "entry {index}: one metadata allocation and one owned allocation per field"
         );
         assert_eq!(
             entry.get("MESSAGE").unwrap(),

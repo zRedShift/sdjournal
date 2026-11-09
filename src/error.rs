@@ -1,5 +1,16 @@
-use std::fmt;
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
+
+/// Why a previously discovered journal snapshot can no longer be consumed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetirementReason {
+    /// The original open inode has no remaining filesystem links.
+    Unlinked,
+    /// The discovered path or journal identity now identifies another file.
+    Replaced,
+    /// A path required to reopen the discovered snapshot no longer exists.
+    Disappeared,
+}
 
 /// Result type used by this crate.
 pub type Result<T> = std::result::Result<T, SdJournalError>;
@@ -72,11 +83,20 @@ impl fmt::Display for LimitKind {
 /// - [`SdJournalError::Corrupt`] means the file contents were internally inconsistent.
 /// - [`SdJournalError::Unsupported`] means the file or operation uses a capability this crate does
 ///   not implement.
-/// - [`SdJournalError::PermissionDenied`] usually requires changing process privileges or opening
-///   a different journal root.
+/// - [`SdJournalError::PermissionDenied`] usually requires changing process privileges or opening a
+///   different journal root.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum SdJournalError {
+    /// A previously discovered journal is no longer the same available file.
+    /// Rediscover at the last consumed cursor; this does not classify linked
+    /// malformed data as ordinary retention.
+    Retired {
+        /// Snapshot path, which may no longer exist.
+        path: PathBuf,
+        /// Positive evidence that the snapshot owner was retired.
+        reason: RetirementReason,
+    },
     /// An operating-system or filesystem I/O failure.
     Io {
         /// Short operation name such as `open`, `read_dir`, or `mmap`.
@@ -144,6 +164,9 @@ impl SdJournalError {
 impl fmt::Display for SdJournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SdJournalError::Retired { path, reason } => {
+                write!(f, "retired journal at {}: {reason:?}", path.display())
+            }
             SdJournalError::Io { op, path, source } => match path {
                 Some(path) => write!(f, "io error during {op} for {}: {source}", path.display()),
                 None => write!(f, "io error during {op}: {source}"),
@@ -158,11 +181,13 @@ impl fmt::Display for SdJournalError {
                 offset,
                 reason,
             } => match (path, offset) {
-                (Some(path), Some(offset)) => write!(
-                    f,
-                    "corrupt journal at {} (offset {offset}): {reason}",
-                    path.display()
-                ),
+                (Some(path), Some(offset)) => {
+                    write!(
+                        f,
+                        "corrupt journal at {} (offset {offset}): {reason}",
+                        path.display()
+                    )
+                }
                 (Some(path), None) => write!(f, "corrupt journal at {}: {reason}", path.display()),
                 (None, Some(offset)) => write!(f, "corrupt journal at offset {offset}: {reason}"),
                 (None, None) => write!(f, "corrupt journal: {reason}"),
@@ -193,8 +218,9 @@ impl std::error::Error for SdJournalError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::error::Error as _;
+
+    use super::*;
 
     #[test]
     fn display_names_for_compression_algo_and_limit_kind_are_stable() {

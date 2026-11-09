@@ -106,14 +106,14 @@ mod reader;
 mod seal;
 mod util;
 
-pub use crate::config::{JournalConfig, LiveQueueFullPolicy, MmapPolicy};
-pub use crate::cursor::Cursor;
-pub use crate::entry::{EntryOwned, EntryRef, LiveEntry};
-pub use crate::error::{CompressionAlgo, LimitKind, Result, SdJournalError};
-pub use crate::journal::Journal;
 #[cfg(feature = "tokio")]
 pub use crate::live::TokioSubscription;
-pub use crate::live::{
-    LiveFilter, LiveJournal, LiveOrGroupBuilder, LiveSubscription, SubscriptionOptions,
+pub use crate::{
+    config::{JournalConfig, LiveQueueFullPolicy, MmapPolicy},
+    cursor::Cursor,
+    entry::{EntryOwned, EntryRef, LiveEntry},
+    error::{CompressionAlgo, LimitKind, Result, RetirementReason, SdJournalError},
+    journal::Journal,
+    live::{LiveFilter, LiveJournal, LiveOrGroupBuilder, LiveSubscription, SubscriptionOptions},
+    query::JournalQuery,
 };
-pub use crate::query::JournalQuery;

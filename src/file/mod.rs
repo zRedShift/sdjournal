@@ -5,32 +5,35 @@ mod entries;
 mod index;
 mod iter;
 #[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
+
+#[cfg(unix)]
 use cache::CachedAccess;
 #[cfg(unix)]
 pub(crate) use cache::ReaderCache;
-
-use crate::config::JournalConfig;
-#[cfg(feature = "mmap")]
-use crate::config::MmapPolicy;
-use crate::error::{LimitKind, Result, SdJournalError};
-use crate::format::{Header, ObjectHeader, STATE_ARCHIVED};
-#[cfg(feature = "mmap")]
-use crate::format::{STATE_OFFLINE, STATE_ONLINE};
-#[cfg(feature = "mmap")]
-use crate::reader::MmapAccess;
-use crate::reader::{ByteBuf, FileAccess, ReopenAccess};
-use crate::util::checked_add_u64;
-use std::fs::File;
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
-
 #[cfg(feature = "tracing")]
 use tracing::debug;
 
 pub(crate) use self::iter::{DataEntryOffsetIter, EntryMeta, EntryRange, FileEntryIter};
+#[cfg(feature = "mmap")]
+use crate::config::MmapPolicy;
+#[cfg(feature = "mmap")]
+use crate::format::{STATE_OFFLINE, STATE_ONLINE};
+#[cfg(feature = "mmap")]
+use crate::reader::MmapAccess;
+use crate::{
+    config::JournalConfig,
+    error::{LimitKind, Result, SdJournalError},
+    format::{Header, ObjectHeader, STATE_ARCHIVED},
+    reader::{ByteBuf, FileAccess, ReopenAccess},
+    util::checked_add_u64,
+};
 
 #[derive(Clone)]
 pub(crate) struct JournalFile {
@@ -68,7 +71,64 @@ enum Access {
     Reopen(ReopenAccess),
 }
 
+pub(super) fn snapshot_open_error(path: &Path, error: std::io::Error) -> SdJournalError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SdJournalError::Retired {
+            path: path.to_owned(),
+            reason: crate::RetirementReason::Disappeared,
+        }
+    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+        SdJournalError::PermissionDenied {
+            path: path.to_owned(),
+        }
+    } else {
+        SdJournalError::io("open", Some(path.to_owned()), error)
+    }
+}
+
 impl JournalFile {
+    /// Validate the actual owner at publication boundaries, never per DATA field.
+    /// mmap still requires the caller's stable-file contract: a stat check does
+    /// not protect a mapping against concurrent truncation. Use Never for live
+    /// journals subject to vacuum.
+    pub(crate) fn validate_snapshot(&self) -> Result<()> {
+        match &self.inner.access {
+            Access::File(access) => {
+                crate::reader::check_file_owner(&access.file, self.path(), self.inner.used_size)
+            }
+            #[cfg(feature = "mmap")]
+            Access::Mmap(access) => {
+                crate::reader::check_file_owner(&access.file, self.path(), self.inner.used_size)
+            }
+            #[cfg(unix)]
+            Access::Cached(access) => access.validate_snapshot(self.inner.used_size),
+            Access::Reopen(_) => {
+                let file = File::open(self.path())
+                    .map_err(|error| snapshot_open_error(self.path(), error))?;
+                #[cfg(unix)]
+                {
+                    let meta = file.metadata().map_err(|error| {
+                        SdJournalError::io("metadata", Some(self.inner.path.clone()), error)
+                    })?;
+                    if (meta.dev(), meta.ino()) != self.inner.file_identity {
+                        return Err(SdJournalError::Retired {
+                            path: self.inner.path.clone(),
+                            reason: crate::RetirementReason::Replaced,
+                        });
+                    }
+                }
+                crate::reader::check_file_owner(&file, self.path(), self.inner.used_size)
+            }
+        }
+    }
+
+    pub(super) fn finish_snapshot_read<T>(&self, result: Result<T>) -> Result<T> {
+        match (result, self.validate_snapshot()) {
+            (_, Err(error @ SdJournalError::Retired { .. })) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+        }
+    }
     // Replace only access, never the caller's retained header/extent/config.
     #[cfg(unix)]
     fn with_direct_access(&self, access: Access) -> Self {
@@ -120,13 +180,7 @@ impl JournalFile {
         config: &JournalConfig,
         reopen_each_read: bool,
     ) -> Result<Self> {
-        let file = Arc::new(File::open(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                SdJournalError::PermissionDenied { path: path.clone() }
-            } else {
-                SdJournalError::io("open", Some(path.clone()), e)
-            }
-        })?);
+        let file = Arc::new(File::open(&path).map_err(|error| snapshot_open_error(&path, error))?);
         #[cfg(test)]
         crate::reader::test_io::opened(&path);
 
@@ -134,6 +188,21 @@ impl JournalFile {
     }
 
     fn open_from_file(
+        path: PathBuf,
+        file: Arc<File>,
+        config: &JournalConfig,
+        reopen_each_read: bool,
+    ) -> Result<Self> {
+        crate::reader::check_file_owner(&file, &path, 0)?;
+        let result =
+            Self::open_from_file_inner(path.clone(), Arc::clone(&file), config, reopen_each_read);
+        match (result, crate::reader::check_file_owner(&file, &path, 0)) {
+            (_, Err(error @ SdJournalError::Retired { .. })) => Err(error),
+            (result, _) => result,
+        }
+    }
+
+    fn open_from_file_inner(
         path: PathBuf,
         file: Arc<File>,
         config: &JournalConfig,
@@ -282,6 +351,11 @@ impl JournalFile {
 
     pub(crate) fn file_id(&self) -> [u8; 16] {
         self.inner.header.file_id
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn file_identity(&self) -> (u64, u64) {
+        self.inner.file_identity
     }
 
     pub(crate) fn seqnum_id(&self) -> [u8; 16] {
