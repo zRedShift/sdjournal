@@ -15,6 +15,114 @@ struct HashItem {
     tail_hash_offset: u64,
 }
 
+#[cfg(all(test, unix))]
+mod prefix_tests {
+    use super::*;
+    use crate::{JournalConfig, MmapPolicy, reader::test_io};
+    use std::{fs::OpenOptions, os::unix::fs::FileExt as _, sync::Arc};
+
+    #[allow(dead_code)]
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/synthetic_journal.rs"
+        ));
+    }
+
+    // Isolate a real ordinary/compact DATA object on an actual descriptor. No
+    // entry/index lookup is needed to exercise the fixed-prefix parser itself.
+    fn object(
+        compact: bool,
+        object_type: u8,
+        declared_size: u64,
+        physical_size: usize,
+    ) -> (fixture::SyntheticJournalFile, JournalFile, u64) {
+        let fixture = fixture::SyntheticJournalFile::new(&["prefix.service"]);
+        let path = fixture.root().join("synthetic.journal");
+        let mut file = JournalFile::open(
+            path.clone(),
+            &JournalConfig {
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let owner = OpenOptions::new().write(true).open(path).unwrap();
+        let offset = file.inner.used_size.next_multiple_of(8);
+        let mut bytes = vec![0; physical_size];
+        bytes[0] = object_type;
+        bytes[8..16].copy_from_slice(&declared_size.to_le_bytes());
+        let prefix = if compact { 72 } else { 64 };
+        if physical_size >= prefix + 5 {
+            bytes[prefix..prefix + 5].copy_from_slice(b"F=\0\xffx");
+        }
+        owner.write_all_at(&bytes, offset).unwrap();
+        owner.set_len(offset + physical_size as u64).unwrap();
+        let inner = Arc::get_mut(&mut file.inner).unwrap();
+        if compact {
+            inner.header.incompatible_flags |= crate::format::HEADER_INCOMPATIBLE_COMPACT;
+        }
+        inner.header.tail_object_offset = offset;
+        inner.used_size = offset + physical_size as u64;
+        (fixture, file, offset)
+    }
+
+    #[test]
+    fn data_prefix_metadata_and_binary_payload_use_two_reads() {
+        let mut observed = Vec::new();
+        for compact in [false, true] {
+            let size = if compact { 77 } else { 69 };
+            let (_fixture, file, offset) = object(compact, OBJECT_DATA, size, size as usize);
+            test_io::reset();
+            let payload = file.read_data_payload_bytes_for_object(offset).unwrap();
+            assert_eq!(payload.as_slice(), b"F=\0\xffx");
+            observed.push((compact, test_io::reads()));
+        }
+        assert_eq!(observed, [(false, 2), (true, 2)]);
+    }
+
+    #[test]
+    fn short_logical_tail_preserves_type_size_and_limit_errors() {
+        for compact in [false, true] {
+            for (kind, size, expected) in [
+                (0, 16, "expected DATA"),
+                (OBJECT_DATA, 16, "too small"),
+                (OBJECT_DATA, 1 << 40, "limit"),
+                (OBJECT_DATA, 80, "extends beyond"),
+            ] {
+                let (_fixture, file, offset) = object(compact, kind, size, 16);
+                let error = file.read_data_payload_bytes_for_object(offset).unwrap_err();
+                if expected == "limit" {
+                    assert!(matches!(error, SdJournalError::LimitExceeded { .. }));
+                } else if expected == "extends beyond" {
+                    assert!(
+                        matches!(&error, SdJournalError::Transient { reason, .. } if reason.contains(expected)),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(&error, SdJournalError::Corrupt { reason, .. } if reason.contains(expected)),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn physical_prefix_truncation_is_not_an_empty_payload() {
+        for compact in [false, true] {
+            let (_fixture, mut file, offset) = object(compact, OBJECT_DATA, 80, 32);
+            // Retain the opening snapshot extent while the physical file is short.
+            Arc::get_mut(&mut file.inner).unwrap().used_size = offset + 80;
+            assert!(matches!(
+                file.read_data_payload_bytes_for_object(offset),
+                Err(SdJournalError::Transient { .. })
+            ));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DataObjectMeta {
     hash: u64,

@@ -40,6 +40,7 @@ pub(crate) mod test_io {
     };
     thread_local! {
         static OPENS: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
+        static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static OBSERVED: RefCell<Option<(PathBuf, (usize, usize))>> = const { RefCell::new(None) };
     }
     pub(crate) fn opened(path: &Path) {
@@ -48,6 +49,13 @@ pub(crate) mod test_io {
     }
     pub(crate) fn reset() {
         OPENS.with(|counts| counts.borrow_mut().clear());
+        READS.with(|count| count.set(0));
+    }
+    pub(crate) fn read_call() {
+        READS.with(|count| count.set(count.get() + 1));
+    }
+    pub(crate) fn reads() -> usize {
+        READS.with(std::cell::Cell::get)
     }
     pub(crate) fn opens(path: &Path) -> usize {
         OPENS.with(|counts| counts.borrow().get(path).copied().unwrap_or(0))
@@ -323,6 +331,8 @@ pub(crate) fn read_exact_at(
 ) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt as _;
     while !buf.is_empty() {
+        #[cfg(test)]
+        test_io::read_call();
         let n = file.read_at(buf, offset)?;
         if n == 0 {
             return Err(std::io::Error::new(
