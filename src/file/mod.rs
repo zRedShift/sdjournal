@@ -150,11 +150,6 @@ impl JournalFile {
         Self::open_with_access(path, config, false)
     }
 
-    #[cfg(not(unix))]
-    pub(crate) fn open_reopen(path: PathBuf, config: &JournalConfig) -> Result<Self> {
-        Self::open_with_access(path, config, true)
-    }
-
     pub(crate) fn reopen_snapshot(&self) -> Self {
         Self {
             inner: Arc::new(JournalFileInner {

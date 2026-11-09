@@ -356,9 +356,13 @@ pub(crate) fn read_exact_at(
     use std::os::unix::fs::FileExt as _;
     while !buf.is_empty() {
         #[cfg(test)]
-        let n = test_io::read_at(file, buf, offset)?;
+        let result = test_io::read_at(file, buf, offset);
         #[cfg(not(test))]
-        let n = file.read_at(buf, offset)?;
+        let result = file.read_at(buf, offset);
+        let n = match result {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -379,7 +383,10 @@ pub(crate) fn read_exact_at(
 ) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt as _;
     while !buf.is_empty() {
-        let n = file.seek_read(buf, offset)?;
+        let n = match file.seek_read(buf, offset) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

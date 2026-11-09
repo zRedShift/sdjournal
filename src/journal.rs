@@ -41,7 +41,8 @@ pub(crate) struct JournalFileInfo {
     pub(crate) seqnum_id: [u8; 16],
     pub(crate) entry_range: Option<EntryRange>,
     pub(crate) entry_range_known: bool,
-    file: Option<JournalFile>,
+    file: JournalFile,
+    keep_open: bool,
     used_size: u64,
     #[cfg(unix)]
     file_identity: (u64, u64),
@@ -129,7 +130,7 @@ impl Journal {
         #[cfg(feature = "tracing")]
         debug!(
             n_files = file_set.file_infos.len(),
-            lazy = file_set.file_infos.iter().any(|info| info.file.is_none()),
+            lazy = file_set.file_infos.iter().any(|info| !info.keep_open),
             "journal opened"
         );
 
@@ -205,8 +206,8 @@ pub(crate) struct JournalFileSet {
 impl JournalInner {
     pub(crate) fn validate_snapshot_owners(&self) -> Result<()> {
         for info in &self.file_infos {
-            if let Some(file) = &info.file {
-                file.validate_snapshot()?;
+            if info.keep_open {
+                info.file.validate_snapshot()?;
             } else {
                 let metadata = std::fs::metadata(&info.path)
                     .map_err(|error| crate::file::snapshot_open_error(&info.path, error))?;
@@ -233,7 +234,7 @@ impl JournalInner {
         Ok(())
     }
     pub(crate) fn is_lazy(&self) -> bool {
-        self.file_infos.iter().any(|info| info.file.is_none())
+        self.file_infos.iter().any(|info| !info.keep_open)
     }
 
     pub(crate) fn file_count(&self) -> usize {
@@ -255,29 +256,26 @@ impl JournalInner {
         if self.is_lazy() {
             return None;
         }
-        self.file_infos
-            .iter()
-            .map(|info| info.file.clone())
-            .collect()
+        Some(
+            self.file_infos
+                .iter()
+                .map(|info| info.file.clone())
+                .collect(),
+        )
     }
 
     pub(crate) fn open_file_by_index(&self, idx: usize) -> Result<JournalFile> {
         let info = self.file_infos.get(idx).ok_or(SdJournalError::NotFound)?;
-        if let Some(file) = &info.file {
-            return Ok(file.clone());
+        if info.keep_open {
+            return Ok(info.file.clone());
         }
         #[cfg(unix)]
-        let file = self
-            .reader_cache
-            .open_file(info.path.clone(), info.file_id, info.seqnum_id)?;
+        let file = self.reader_cache.open_file(&info.file)?;
         #[cfg(not(unix))]
-        let file = JournalFile::open_reopen(info.path.clone(), &self.config)?;
-        if file.file_id() != info.file_id || file.seqnum_id() != info.seqnum_id {
-            return Err(SdJournalError::Transient {
-                path: Some(info.path.clone()),
-                reason: "journal file was replaced after discovery".to_string(),
-            });
-        }
+        let file = {
+            info.file.validate_snapshot()?;
+            info.file.clone()
+        };
         Ok(file)
     }
 }
@@ -300,7 +298,12 @@ impl JournalFileInfo {
             seqnum_id,
             entry_range,
             entry_range_known,
-            file: keep_open.then_some(file),
+            file: if keep_open {
+                file
+            } else {
+                file.reopen_snapshot()
+            },
+            keep_open,
             used_size,
             #[cfg(unix)]
             file_identity,

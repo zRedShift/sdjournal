@@ -35,6 +35,7 @@ struct CachedReader {
     identity: (u64, u64),
     file_id: [u8; 16],
     seqnum_id: [u8; 16],
+    #[cfg(feature = "mmap")]
     mapped_len: u64,
 }
 
@@ -45,6 +46,7 @@ pub(super) struct CachedAccess {
     file_id: [u8; 16],
     seqnum_id: [u8; 16],
     cache: Arc<ReaderCache>,
+    template: JournalFile,
 }
 
 fn transient(path: &Path, reason: &str) -> SdJournalError {
@@ -79,77 +81,67 @@ impl ReaderCache {
         })
     }
 
-    /// Opening/parsing snapshots also uses the budget: no temporary budget+1 FD.
-    pub(crate) fn open_file(
-        self: &Arc<Self>,
-        path: PathBuf,
-        file_id: [u8; 16],
-        seqnum_id: [u8; 16],
-    ) -> Result<JournalFile> {
+    /// Reuse discovery bounds while acquiring native access under the FD budget.
+    pub(crate) fn open_file(self: &Arc<Self>, template: &JournalFile) -> Result<JournalFile> {
+        let path = template.path();
         let mut entries = self
             .entries
             .lock()
-            .map_err(|_| transient(&path, "journal reader cache lock poisoned"))?;
+            .map_err(|_| transient(path, "journal reader cache lock poisoned"))?;
         let mut reader = if let Some(index) = entries.iter().rposition(|entry| entry.path == path) {
             entries
                 .remove(index)
-                .ok_or_else(|| transient(&path, "journal reader cache slot disappeared"))?
+                .ok_or_else(|| transient(path, "journal reader cache slot disappeared"))?
         } else {
             if entries.len() == self.config.max_open_files {
                 drop(entries.pop_front());
             }
-            CachedReader::open(path.clone(), &self.config)?
+            CachedReader::open(template)?
         };
-        reader.validate(&path, None, file_id, seqnum_id)?;
-        // Drop an old map before parsing can create a replacement map.
-        reader.access = Access::File(FileAccess::new(path.clone(), Arc::clone(&reader.file)));
-        let mut snapshot = JournalFile::open_from_file(
-            path.clone(),
-            Arc::clone(&reader.file),
-            &self.config,
-            false,
-        )?;
-        if snapshot.file_id() != file_id || snapshot.seqnum_id() != seqnum_id {
-            return Err(SdJournalError::Retired {
-                path,
-                reason: crate::RetirementReason::Replaced,
-            });
-        }
-        reader.access = snapshot.inner.access.clone();
-        reader.mapped_len = snapshot.inner.file_len;
-        let identity = snapshot.inner.file_identity;
-        // This freshly constructed snapshot has no other owners yet.
-        let inner = Arc::get_mut(&mut snapshot.inner)
-            .ok_or_else(|| transient(&path, "new journal snapshot unexpectedly shared"))?;
-        inner.access = Access::Cached(CachedAccess {
+        let (_, length) = reader.validate(
             path,
-            identity,
-            file_id,
-            seqnum_id,
+            Some(template.inner.file_identity),
+            template.file_id(),
+            template.seqnum_id(),
+        )?;
+        if length < template.inner.used_size {
+            return Err(transient(path, "file was truncated while reading"));
+        }
+        let snapshot = template.with_direct_access(Access::Cached(CachedAccess {
+            path: path.to_owned(),
+            identity: template.inner.file_identity,
+            file_id: template.file_id(),
+            seqnum_id: template.seqnum_id(),
+            template: template.reopen_snapshot(),
             cache: Arc::clone(self),
-        });
+        }));
         entries.push_back(reader);
         Ok(snapshot)
     }
 }
 
 impl CachedReader {
-    fn open(path: PathBuf, config: &JournalConfig) -> Result<Self> {
+    fn open(template: &JournalFile) -> Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
+        let path = template.path().to_owned();
         let file = Arc::new(File::open(&path).map_err(|error| open_error(&path, error))?);
         #[cfg(test)]
         crate::reader::test_io::opened(&path);
+        crate::reader::check_file_owner(&file, &path, template.inner.used_size)?;
         let metadata = file
             .metadata()
             .map_err(|e| SdJournalError::io("metadata", Some(path.clone()), e))?;
-        let snapshot = JournalFile::open_from_file(path.clone(), Arc::clone(&file), config, false)?;
+        // Never parse a new header/tail on a cache miss: the current writer may
+        // be appending beyond the immutable discovery snapshot. validate() below
+        // still checks the held inode, fresh identity prefix and current state.
         Ok(Self {
+            access: Access::File(FileAccess::new(path.clone(), Arc::clone(&file))),
             path,
             file,
-            access: snapshot.inner.access.clone(),
             identity: (metadata.dev(), metadata.ino()),
-            file_id: snapshot.file_id(),
-            seqnum_id: snapshot.seqnum_id(),
+            file_id: template.file_id(),
+            seqnum_id: template.seqnum_id(),
+            #[cfg(feature = "mmap")]
             mapped_len: metadata.len(),
         })
     }
@@ -330,7 +322,7 @@ impl CachedAccess {
                     drop(entries.pop_front());
                 }
                 self.validate_snapshot(snapshot.inner.used_size)?;
-                CachedReader::open(self.path.clone(), &self.cache.config)?
+                CachedReader::open(&self.template)?
             };
         let result = (|| {
             let (state, file_len) = reader.validate(
@@ -397,7 +389,7 @@ impl CachedAccess {
                 if entries.len() == self.cache.config.max_open_files {
                     drop(entries.pop_front());
                 }
-                CachedReader::open(self.path.clone(), &self.cache.config)?
+                CachedReader::open(&self.template)?
             };
         let result = reader.read(self, offset, len, &self.cache.config);
         if result.is_ok() {
@@ -437,14 +429,18 @@ mod tests {
         (root, paths)
     }
     fn open(cache: &Arc<ReaderCache>, path: &Path) -> JournalFile {
-        let bytes = std::fs::read(path).unwrap();
-        cache
-            .open_file(
-                path.to_owned(),
-                bytes[24..40].try_into().unwrap(),
-                bytes[72..88].try_into().unwrap(),
-            )
+        // Model a new discovery without exceeding the cache's existing native
+        // budget while this fixture opens its descriptor-free template.
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            if entries.len() == cache.config.max_open_files {
+                drop(entries.pop_front());
+            }
+        }
+        let template = JournalFile::open(path.to_owned(), &cache.config)
             .unwrap()
+            .reopen_snapshot();
+        cache.open_file(&template).unwrap()
     }
     fn patch(path: &Path, offset: u64, bytes: &[u8]) {
         std::fs::OpenOptions::new()
