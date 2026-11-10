@@ -73,6 +73,24 @@ impl EntryArrayCursor {
         };
 
         let split = partition_entry_array(&file, &arrays[array_idx], after_entry_offset, reverse)?;
+        Ok(Self::from_validated_split(
+            file,
+            arrays,
+            reverse,
+            array_idx,
+            split,
+            after_entry_offset,
+        ))
+    }
+
+    fn from_validated_split(
+        file: JournalFile,
+        arrays: Vec<EntryArrayDescriptor>,
+        reverse: bool,
+        array_idx: usize,
+        split: usize,
+        after_entry_offset: u64,
+    ) -> Self {
         let mut cursor = Self {
             file,
             reverse,
@@ -89,7 +107,7 @@ impl EntryArrayCursor {
             exhausted: false,
         };
         cursor.skip_exhausted_array();
-        Ok(cursor)
+        cursor
     }
 
     fn skip_exhausted_array(&mut self) {
@@ -385,6 +403,7 @@ impl FileEntryIter {
             false,
         )?;
         let mut matched = None;
+        let mut matched_split = None;
         if let Some(position) = position {
             let array_index =
                 descriptors.partition_point(|array| array.last < position.entry_offset);
@@ -425,6 +444,7 @@ impl FileEntryIter {
                                 });
                             }
                             matched = Some(ordinal);
+                            matched_split = Some((array_index, split + 1));
                         }
                         Err(error @ SdJournalError::Retired { .. }) => return Err(error),
                         Err(
@@ -437,13 +457,17 @@ impl FileEntryIter {
                 }
             }
         }
-        let arrays = if matched.is_some() {
-            EntryArrayCursor::new_after_offset(
+        let arrays = if let Some((array_index, split)) = matched_split {
+            // The descriptor prefix already validated strict slot ordering and
+            // the search above proved this exact member. Reuse its successor.
+            EntryArrayCursor::from_validated_split(
                 file.clone(),
                 descriptors,
                 false,
+                array_index,
+                split,
                 position.map_or(0, |p| p.entry_offset),
-            )?
+            )
         } else {
             EntryArrayCursor::new(file.clone(), descriptors, false)
         };

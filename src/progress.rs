@@ -120,9 +120,17 @@ pub struct FileBoundary {
 }
 
 /// Explicit collection-local cache limits. The general query API never enables it.
+///
+/// Hits reuse previously verified owned DATA from this captured OFFLINE/ARCHIVED
+/// snapshot without rereading its backing bytes. A linked, same-inode rewrite
+/// can retain the earlier value until the scan ends; a fresh scan reads the
+/// changed data. This opt-in policy relies on committed DATA immutability, not
+/// metadata timestamps as write epochs. Native owner/publication guards still run.
 #[derive(Debug, Clone, Copy)]
 pub struct DataCacheConfig {
-    /// Maximum cache-owned decoded payload bytes, excluding metadata/current entry.
+    /// Maximum retained decoded payload bytes. This is not total process memory:
+    /// bounded map/FIFO/staging metadata, the current entry and externally held
+    /// Arc payload owners are excluded.
     pub max_bytes: usize,
     /// Maximum unique DATA payloads retained.
     pub max_entries: usize,
@@ -140,6 +148,7 @@ impl Default for DataCacheConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
     /// Opt into immutable committed-DATA snapshot reuse for OFFLINE/ARCHIVED files.
+    /// See [`DataCacheConfig`] for same-snapshot rewrite visibility and byte scope.
     pub snapshot_cache: Option<DataCacheConfig>,
     /// Restrict a rediscovery to these original file identities/ranges.
     pub boundaries: Option<Vec<FileBoundary>>,
@@ -309,7 +318,13 @@ impl PayloadCache {
     }
 }
 
+struct ScanOwner {
+    file: JournalFile,
+    reported_failure: bool,
+}
+
 struct FileScan {
+    owner_index: usize,
     file: JournalFile,
     identity: FileIdentity,
     iter: FileEntryIter,
@@ -323,7 +338,7 @@ struct FileScan {
 /// Retirement is a top-level error so the caller can rediscover once under its
 /// original deadline. The caller alone decides which positions become durable.
 pub struct PositionedScan {
-    owners: Vec<JournalFile>,
+    owners: Vec<ScanOwner>,
     files: Vec<FileScan>,
     notices: VecDeque<ScanItem>,
     cache: Option<PayloadCache>,
@@ -530,7 +545,11 @@ impl Journal {
                 };
             }
             let identity = FileIdentity::from_file(&file);
-            scan.owners.push(file.clone());
+            let owner_index = scan.owners.len();
+            scan.owners.push(ScanOwner {
+                file: file.clone(),
+                reported_failure: false,
+            });
             let position = marks.get(&info.file_id).copied();
             if let Some(position) = position {
                 match file.position_is_stable_tail(position) {
@@ -538,10 +557,7 @@ impl Journal {
                     Ok(false) => {}
                     Err(error @ SdJournalError::Retired { .. }) => return Err(error),
                     Err(error) => {
-                        scan.notices.push_back(ScanItem::FileStopped {
-                            file: identity,
-                            error,
-                        });
+                        scan.report_owner_error(owner_index, error)?;
                         continue;
                     }
                 }
@@ -554,6 +570,7 @@ impl Journal {
                         });
                     }
                     scan.files.push(FileScan {
+                        owner_index,
                         file,
                         identity,
                         iter,
@@ -562,20 +579,47 @@ impl Journal {
                     });
                 }
                 Err(error @ SdJournalError::Retired { .. }) => return Err(error),
-                Err(error) => scan.notices.push_back(ScanItem::FileStopped {
-                    file: identity,
-                    error,
-                }),
+                Err(error) => scan.report_owner_error(owner_index, error)?,
             }
         }
-        for owner in &scan.owners {
-            owner.validate_snapshot()?;
-        }
+        scan.validate_owners()?;
         Ok(scan)
     }
 }
 
 impl PositionedScan {
+    // Keep retirement global, but a linked per-file failure must never poison
+    // a healthy peer. A failed owner is still rechecked for actual retirement.
+    fn report_owner_error(&mut self, index: usize, error: SdJournalError) -> Result<()> {
+        if matches!(error, SdJournalError::Retired { .. }) {
+            return Err(error);
+        }
+        let owner = &mut self.owners[index];
+        if !owner.reported_failure {
+            self.notices.push_back(ScanItem::FileStopped {
+                file: FileIdentity::from_file(&owner.file),
+                error,
+            });
+            owner.reported_failure = true;
+        }
+        for file in &mut self.files {
+            if file.owner_index == index {
+                file.stopped = true;
+                file.next = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_owners(&mut self) -> Result<()> {
+        for index in 0..self.owners.len() {
+            if let Err(error) = self.owners[index].file.validate_snapshot() {
+                self.report_owner_error(index, error)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a non-stopped file has queued metadata or validated unread slots.
     /// Does not perform I/O or promise the unread payloads are healthy. A yielded
     /// record rejected by the caller's size cap is additional unconsumed work.
@@ -604,15 +648,7 @@ impl PositionedScan {
                 file.file.validate_snapshot()?;
                 Ok(())
             }
-            Some(Err(error @ SdJournalError::Retired { .. })) => Err(error),
-            Some(Err(error)) => {
-                file.stopped = true;
-                self.notices.push_back(ScanItem::FileStopped {
-                    file: file.identity.clone(),
-                    error,
-                });
-                Ok(())
-            }
+            Some(Err(error)) => Err(error),
             Some(Ok((offset, ordinal))) => match file.file.read_entry_meta(offset) {
                 Ok(meta) => {
                     file.next = Some((meta, ordinal));
@@ -629,14 +665,7 @@ impl PositionedScan {
                     });
                     Ok(())
                 }
-                Err(error) => {
-                    file.stopped = true;
-                    self.notices.push_back(ScanItem::FileStopped {
-                        file: file.identity.clone(),
-                        error,
-                    });
-                    Ok(())
-                }
+                Err(error) => Err(error),
             },
         }
     }
@@ -645,15 +674,18 @@ impl PositionedScan {
 impl Iterator for PositionedScan {
     type Item = Result<ScanItem>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
         if let Some(notice) = self.notices.pop_front() {
             return Some(Ok(notice));
         }
+        if self.done {
+            return None;
+        }
         for index in 0..self.files.len() {
-            if let Err(error) = self.prime(index) {
+            if let Err(error) = self.prime(index)
+                && let Err(error) = self.report_owner_error(self.files[index].owner_index, error)
+            {
                 self.done = true;
+                self.notices.clear();
                 return Some(Err(error));
             }
             if let Some(notice) = self.notices.pop_front() {
@@ -680,12 +712,11 @@ impl Iterator for PositionedScan {
         }
         let Some(index) = selected else {
             self.done = true;
-            for owner in &self.owners {
-                if let Err(error) = owner.validate_snapshot() {
-                    return Some(Err(error));
-                }
+            if let Err(error) = self.validate_owners() {
+                self.notices.clear();
+                return Some(Err(error));
             }
-            return None;
+            return self.notices.pop_front().map(Ok);
         };
         let Some((meta, ordinal)) = self.files[index].next.take() else {
             self.done = true;
@@ -698,22 +729,28 @@ impl Iterator for PositionedScan {
         match result {
             Ok(entry) => {
                 let mut aliases = Vec::new();
-                for (other_index, file) in self.files.iter_mut().enumerate() {
+                for other_index in 0..self.files.len() {
                     if other_index == index {
                         continue;
                     }
-                    if let Some((other, ordinal)) = file.next
+                    if let Some((other, ordinal)) = self.files[other_index].next
                         && same_entry(
                             &crate::query::meta_key(&meta),
                             &crate::query::meta_key(&other),
                         )
                     {
-                        if let Err(error) = file.file.validate_snapshot() {
-                            self.done = true;
-                            return Some(Err(error));
+                        if let Err(error) = self.files[other_index].file.validate_snapshot() {
+                            if let Err(error) =
+                                self.report_owner_error(self.files[other_index].owner_index, error)
+                            {
+                                self.done = true;
+                                self.notices.clear();
+                                return Some(Err(error));
+                            }
+                            continue;
                         }
                         aliases.push(FilePosition::from_meta(other, ordinal));
-                        file.next = None;
+                        self.files[other_index].next = None;
                     }
                 }
                 Some(Ok(ScanItem::Entry {
@@ -724,6 +761,7 @@ impl Iterator for PositionedScan {
             }
             Err(error @ SdJournalError::Retired { .. }) => {
                 self.done = true;
+                self.notices.clear();
                 Some(Err(error))
             }
             Err(error) if omittable(&error) => Some(Ok(ScanItem::Omitted {
@@ -734,11 +772,12 @@ impl Iterator for PositionedScan {
                 error,
             })),
             Err(error) => {
-                self.files[index].stopped = true;
-                Some(Ok(ScanItem::FileStopped {
-                    file: self.files[index].identity.clone(),
-                    error,
-                }))
+                if let Err(error) = self.report_owner_error(self.files[index].owner_index, error) {
+                    self.done = true;
+                    self.notices.clear();
+                    return Some(Err(error));
+                }
+                self.notices.pop_front().map(Ok)
             }
         }
     }
@@ -875,5 +914,55 @@ mod tests {
             assert!(legacy > direct);
             println!("tail entries={n}: positioned={direct} old-query={legacy}");
         }
+    }
+}
+
+#[cfg(test)]
+mod correction_tests {
+    use super::*;
+    use crate::{JournalConfig, MmapPolicy, reader::test_io};
+    #[allow(dead_code)]
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/synthetic_journal.rs"
+        ));
+    }
+    #[test]
+    fn positioned_resume_does_not_repeat_validated_anchor_search() {
+        let fixture = fixture::SyntheticJournalFile::new(&vec!["same"; 256]);
+        let journal = Journal::open_progress_dirs(
+            &[fixture.root().to_owned()],
+            JournalConfig {
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let file = journal.inner.open_file_by_index(0).unwrap();
+        let mut scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap();
+        let mut anchor = None;
+        for _ in 0..128 {
+            if let ScanItem::Entry { position, .. } = scan.next().unwrap().unwrap() {
+                anchor = Some(position);
+            }
+        }
+        let anchor = anchor.unwrap();
+        test_io::reset();
+        let _ = FileEntryIter::positioned(file.clone(), None).unwrap();
+        let index_reads = test_io::reads();
+        test_io::reset();
+        let (mut resumed, ordinal) = FileEntryIter::positioned(file, Some(&anchor)).unwrap();
+        let resume_reads = test_io::reads();
+        assert_eq!(ordinal, Some(128));
+        println!("native anchor reads: index={index_reads},resume={resume_reads}");
+        assert!(
+            resume_reads <= index_reads + 11,
+            "index={index_reads},resume={resume_reads}: at most one 256-slot binary membership search plus confirmation/metadata"
+        );
+        assert_eq!(resumed.next_slot().unwrap().unwrap().1, 129);
     }
 }

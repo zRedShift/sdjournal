@@ -702,3 +702,122 @@ fn failed_entry_never_seeds_cache_and_evicted_entries_remain_owned() {
     .unwrap();
     assert_eq!(entry.get("MESSAGE").unwrap(), expected);
 }
+
+fn truncate_linked(path: &Path) {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(272)
+        .unwrap();
+}
+
+fn assert_healthy_peer_and_one_stop(
+    items: Vec<sdjournal::Result<ScanItem>>,
+    victim: &Path,
+    expected: usize,
+) {
+    let mut healthy = 0;
+    let mut stopped = 0;
+    for item in items {
+        match item.expect("one linked failure must not abort healthy peer") {
+            ScanItem::Entry { entry, .. } => {
+                assert!(entry.get("MESSAGE").unwrap().ends_with(b"healthy"));
+                healthy += 1;
+            }
+            ScanItem::FileStopped {
+                file,
+                error: SdJournalError::Transient { .. },
+            } => {
+                assert_eq!(file.path, victim);
+                stopped += 1;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(healthy, expected);
+    assert_eq!(
+        stopped, 1,
+        "report the failed owner once, including final validation"
+    );
+}
+
+#[test]
+fn linked_truncation_during_setup_stops_only_its_file() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("a.journal");
+        write_synthetic_journal_file(&victim, &["victim"], 7);
+        write_synthetic_journal_file(&root.path().join("b.journal"), &["healthy", "healthy"], 8);
+        let journal = open(root.path(), budget);
+        truncate_linked(&victim);
+        let scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .expect("per-file Transient must stay a notice");
+        assert_healthy_peer_and_one_stop(scan.collect(), &victim, 2);
+    }
+}
+
+#[test]
+fn linked_truncation_during_eof_priming_stops_only_its_file() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("a.journal");
+        write_synthetic_journal_file(&victim, &["victim"], 7);
+        write_synthetic_journal_file(&root.path().join("b.journal"), &["healthy", "healthy"], 8);
+        let journal = open(root.path(), budget);
+        let mut scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap();
+        let ScanItem::Entry { entry, .. } = scan.next().unwrap().unwrap() else {
+            panic!()
+        };
+        assert!(entry.get("MESSAGE").unwrap().ends_with(b"victim"));
+        truncate_linked(&victim);
+        assert_healthy_peer_and_one_stop(scan.collect(), &victim, 2);
+    }
+}
+
+#[test]
+fn linked_truncation_of_fast_eof_owner_is_reported_at_final_validation() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("a.journal");
+        write_synthetic_journal_file(&victim, &["victim"], 7);
+        write_synthetic_journal_file(&root.path().join("b.journal"), &["healthy", "healthy"], 8);
+        let journal = open(root.path(), budget);
+        let mark = records(&journal, &[], ScanOptions::default())[0].1;
+        let mut scan = journal
+            .scan_from_positions(&[mark], ScanOptions::default())
+            .unwrap();
+        assert!(matches!(
+            scan.next().unwrap().unwrap(),
+            ScanItem::Entry { .. }
+        ));
+        truncate_linked(&victim);
+        assert_healthy_peer_and_one_stop(scan.collect(), &victim, 1);
+    }
+}
+
+#[test]
+fn unlink_during_eof_priming_remains_global_retirement() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("a.journal");
+        write_synthetic_journal_file(&victim, &["victim"], 7);
+        write_synthetic_journal_file(&root.path().join("b.journal"), &["healthy"], 8);
+        let journal = open(root.path(), budget);
+        let mut scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap();
+        let ScanItem::Entry { entry, .. } = scan.next().unwrap().unwrap() else {
+            panic!()
+        };
+        assert!(entry.get("MESSAGE").unwrap().ends_with(b"victim"));
+        fs::remove_file(&victim).unwrap();
+        assert!(matches!(
+            scan.next().unwrap(),
+            Err(SdJournalError::Retired { .. })
+        ));
+    }
+}
