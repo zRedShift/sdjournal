@@ -57,22 +57,39 @@ impl JournalFile {
         self.read_entry_ref_with_cache(entry_offset, None)
     }
 
-    pub(crate) fn read_entry_ref_with_cache(&self, entry_offset: u64, mut cache: Option<&mut crate::progress::PayloadCache>) -> Result<EntryRef> {
-        if let Some(cache) = cache.as_deref_mut() { cache.begin(); }
+    pub(crate) fn read_entry_ref_with_cache(
+        &self,
+        entry_offset: u64,
+        mut cache: Option<&mut crate::progress::PayloadCache>,
+    ) -> Result<EntryRef> {
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.begin();
+        }
         let result = self.read_entry_transaction(entry_offset, cache.as_deref_mut());
-        if let Some(cache) = cache { cache.finish(result.is_ok()); }
+        if let Some(cache) = cache {
+            cache.finish(result.is_ok());
+        }
         result
     }
 
-    fn read_entry_transaction(&self, entry_offset: u64, cache: Option<&mut crate::progress::PayloadCache>) -> Result<EntryRef> {
+    fn read_entry_transaction(
+        &self,
+        entry_offset: u64,
+        cache: Option<&mut crate::progress::PayloadCache>,
+    ) -> Result<EntryRef> {
         #[cfg(unix)]
         if let super::Access::Cached(access) = &self.inner.access {
-            return access.read_entry_with_cache(self, entry_offset, cache);
+            return match cache {
+                Some(cache) => access.read_entry_with_cache(self, entry_offset, Some(cache)),
+                None => access.read_entry(self, entry_offset),
+            };
         }
         self.validate_snapshot()?;
-        let result = self
-            .read_entry_ref_inner_with_cache(entry_offset, cache)
-            .map(EntryRef::into_owned_payloads);
+        let result = match cache {
+            Some(cache) => self.read_entry_ref_inner_with_cache(entry_offset, Some(cache)),
+            None => self.read_entry_ref_inner(entry_offset),
+        }
+        .map(EntryRef::into_owned_payloads);
         #[cfg(test)]
         publication_hook();
         self.finish_snapshot_read(result)
@@ -82,7 +99,11 @@ impl JournalFile {
         self.read_entry_ref_inner_with_cache(entry_offset, None)
     }
 
-    pub(super) fn read_entry_ref_inner_with_cache(&self, entry_offset: u64, mut cache: Option<&mut crate::progress::PayloadCache>) -> Result<EntryRef> {
+    pub(super) fn read_entry_ref_inner_with_cache(
+        &self,
+        entry_offset: u64,
+        mut cache: Option<&mut crate::progress::PayloadCache>,
+    ) -> Result<EntryRef> {
         let parsed = self.read_entry_header(entry_offset)?;
         let entry_bytes = self.read_object(entry_offset, parsed.size)?;
         let entry_bytes = entry_bytes.as_slice();
@@ -106,11 +127,17 @@ impl JournalFile {
         let mut fields_in_order = Vec::with_capacity(data_offsets.len());
         let mut total_payload_bytes = 0u64;
         for data_offset in data_offsets {
-            let cached = cache.as_deref_mut().and_then(|cache| cache.get(self, data_offset));
-            let (payload, eq) = if let Some(cached) = cached { cached } else {
+            let cached = cache
+                .as_deref_mut()
+                .and_then(|cache| cache.get(self, data_offset));
+            let (payload, eq) = if let Some(cached) = cached {
+                cached
+            } else {
                 let payload = self.read_data_payload_bytes_for_object(data_offset)?;
                 let (_, eq) = self.parse_data_field_name(data_offset, payload.as_slice())?;
-                if let Some(cache) = cache.as_deref_mut() { cache.stage(self, data_offset, &payload, eq); }
+                if let Some(cache) = cache.as_deref_mut() {
+                    cache.stage(self, data_offset, &payload, eq);
+                }
                 (payload, eq)
             };
             total_payload_bytes = total_payload_bytes

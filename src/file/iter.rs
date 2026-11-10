@@ -155,7 +155,12 @@ impl EntryArrayCursor {
             items_per_chunk,
         );
         let mut items = read_entry_array_item_range(&self.file, &array, start, end)?;
-        self.next_ordinal = array.prefix_items + if self.reverse { end as u64 } else { start as u64 + 1 };
+        self.next_ordinal = array.prefix_items
+            + if self.reverse {
+                end as u64
+            } else {
+                start as u64 + 1
+            };
         self.next_item_idx = if self.reverse { start } else { end };
         if self.reverse {
             items.reverse();
@@ -199,7 +204,11 @@ impl Iterator for EntryArrayCursor {
             }
             if let Some(offset) = self.current_items.pop_front() {
                 self.last_ordinal = self.next_ordinal;
-                self.next_ordinal = if self.reverse { self.next_ordinal.saturating_sub(1) } else { self.next_ordinal.saturating_add(1) };
+                self.next_ordinal = if self.reverse {
+                    self.next_ordinal.saturating_sub(1)
+                } else {
+                    self.next_ordinal.saturating_add(1)
+                };
                 return Some(Ok(offset));
             }
             self.skip_exhausted_array();
@@ -347,42 +356,122 @@ pub(crate) struct FileEntryIter {
 }
 
 impl FileEntryIter {
-    pub(crate) fn positioned(file: JournalFile, position: Option<&crate::FilePosition>) -> Result<(Self, Option<u64>)> {
+    pub(crate) fn has_remaining_slots(&self) -> bool {
+        if self.exhausted || self.arrays.exhausted {
+            return false;
+        }
+        if !self.arrays.current_items.is_empty() {
+            return true;
+        }
+        let Ok(index) = usize::try_from(self.arrays.current_array_idx) else {
+            return false;
+        };
+        self.arrays
+            .arrays
+            .get(index)
+            .is_some_and(|array| self.arrays.next_item_idx < array.used_items)
+            || index.saturating_add(1) < self.arrays.arrays.len()
+    }
+
+    pub(crate) fn positioned(
+        file: JournalFile,
+        position: Option<&crate::FilePosition>,
+    ) -> Result<(Self, Option<u64>)> {
         file.validate_snapshot()?;
-        let descriptors = collect_entry_array_descriptors(&file, file.inner.header.entry_array_offset, file.inner.header.n_entries, false)?;
+        let descriptors = collect_entry_array_descriptors(
+            &file,
+            file.inner.header.entry_array_offset,
+            file.inner.header.n_entries,
+            false,
+        )?;
         let mut matched = None;
         if let Some(position) = position {
-            let array_index = descriptors.partition_point(|array| array.last < position.entry_offset);
+            let array_index =
+                descriptors.partition_point(|array| array.last < position.entry_offset);
             if let Some(array) = descriptors.get(array_index)
-                && array.first <= position.entry_offset {
+                && array.first <= position.entry_offset
+            {
                 let split = partition_point_result(array.used_items, |index| {
-                    Ok(read_entry_array_item(&file, array.offset, &array.layout, index)? < position.entry_offset)
+                    Ok(
+                        read_entry_array_item(&file, array.offset, &array.layout, index)?
+                            < position.entry_offset,
+                    )
                 })?;
                 if split < array.used_items
-                    && read_entry_array_item(&file, array.offset, &array.layout, split)? == position.entry_offset {
+                    && read_entry_array_item(&file, array.offset, &array.layout, split)?
+                        == position.entry_offset
+                {
                     let ordinal = array.prefix_items + split as u64 + 1;
                     match file.read_entry_meta(position.entry_offset) {
-                        Ok(meta) if position.matches(&meta) && (position.ordinal == 0 || position.ordinal == ordinal) => matched = Some(ordinal),
+                        Ok(meta)
+                            if position.matches(&meta)
+                                && (position.ordinal == 0 || position.ordinal == ordinal) =>
+                        {
+                            if ordinal == file.inner.header.n_entries
+                                && (file
+                                    .inner
+                                    .header
+                                    .tail_entry_seqnum
+                                    .is_some_and(|seq| seq != meta.seqnum)
+                                    || file
+                                        .inner
+                                        .header
+                                        .tail_entry_offset
+                                        .is_some_and(|tail| tail != meta.entry_offset))
+                            {
+                                return Err(SdJournalError::Transient {
+                                    path: Some(file.path().to_owned()),
+                                    reason: "contradictory committed tail identity".into(),
+                                });
+                            }
+                            matched = Some(ordinal);
+                        }
                         Err(error @ SdJournalError::Retired { .. }) => return Err(error),
-                        Err(error @ (SdJournalError::Io { .. } | SdJournalError::PermissionDenied { .. } | SdJournalError::Transient { .. })) => return Err(error),
+                        Err(
+                            error @ (SdJournalError::Io { .. }
+                            | SdJournalError::PermissionDenied { .. }
+                            | SdJournalError::Transient { .. }),
+                        ) => return Err(error),
                         _ => {}
                     }
                 }
             }
         }
         let arrays = if matched.is_some() {
-            EntryArrayCursor::new_after_offset(file.clone(), descriptors, false, position.map_or(0, |p| p.entry_offset))?
-        } else { EntryArrayCursor::new(file.clone(), descriptors, false) };
+            EntryArrayCursor::new_after_offset(
+                file.clone(),
+                descriptors,
+                false,
+                position.map_or(0, |p| p.entry_offset),
+            )?
+        } else {
+            EntryArrayCursor::new(file.clone(), descriptors, false)
+        };
         file.validate_snapshot()?;
-        Ok((Self { file, arrays, exhausted: false }, matched))
+        Ok((
+            Self {
+                file,
+                arrays,
+                exhausted: false,
+            },
+            matched,
+        ))
     }
 
     pub(crate) fn next_slot(&mut self) -> Option<Result<(u64, u64)>> {
-        if self.exhausted { return None; }
+        if self.exhausted {
+            return None;
+        }
         match self.arrays.next() {
             Some(Ok(offset)) => Some(Ok((offset, self.arrays.last_ordinal))),
-            Some(Err(error)) => { self.exhausted = true; Some(Err(error)) }
-            None => { self.exhausted = true; None }
+            Some(Err(error)) => {
+                self.exhausted = true;
+                Some(Err(error))
+            }
+            None => {
+                self.exhausted = true;
+                None
+            }
         }
     }
 

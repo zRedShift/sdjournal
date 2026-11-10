@@ -57,10 +57,13 @@ pub(crate) struct JournalDiscovery {
 impl Journal {
     /// Discover default roots for positioned collection, preserving failed/empty
     /// catalogs. Inspect [`Journal::open_errors`] and [`Journal::deferred_files`].
-    pub fn open_progress_default(config: JournalConfig, deferred: &[crate::FileIdentity]) -> Result<Self> {
+    pub fn open_progress_default(
+        config: JournalConfig,
+        deferred: &[crate::FileIdentity],
+    ) -> Result<Self> {
         core::cfg_select! {
             target_os = "linux" => {
-                Self::open_progress_dirs(&[PathBuf::from("/run/log/journal"), PathBuf::from("/var/log/journal")], config, deferred)
+                Self::open_progress_dirs_impl(&[PathBuf::from("/run/log/journal"), PathBuf::from("/var/log/journal")], config, deferred, true)
             }
             _ => { let _ = (config, deferred); Err(SdJournalError::Unsupported { reason: "default journals require Linux".into() }) }
         }
@@ -69,27 +72,60 @@ impl Journal {
     /// Open a best-effort positioned-scan catalog, retaining all initial errors.
     /// A deferred path with a positively different inode remains eligible.
     /// Unlike ordinary open, zero usable files is a valid (possibly failed) catalog.
-    pub fn open_progress_dirs(paths: &[PathBuf], config: JournalConfig, deferred: &[crate::FileIdentity]) -> Result<Self> {
+    pub fn open_progress_dirs(
+        paths: &[PathBuf],
+        config: JournalConfig,
+        deferred: &[crate::FileIdentity],
+    ) -> Result<Self> {
+        Self::open_progress_dirs_impl(paths, config, deferred, false)
+    }
+
+    fn open_progress_dirs_impl(
+        paths: &[PathBuf],
+        config: JournalConfig,
+        deferred: &[crate::FileIdentity],
+        optional_roots: bool,
+    ) -> Result<Self> {
         validate_journal_config(&config)?;
         if deferred.len() > config.max_journal_files {
-            return Err(SdJournalError::LimitExceeded { kind: LimitKind::JournalFiles, limit: config.max_journal_files as u64 });
+            return Err(SdJournalError::LimitExceeded {
+                kind: LimitKind::JournalFiles,
+                limit: config.max_journal_files as u64,
+            });
         }
-        let discovery = discover_journal_candidates(paths, &config)?;
+        let ProgressDiscovery {
+            discovery,
+            mut errors,
+            mut excluded,
+        } = discover_progress_candidates(paths, &config, deferred, optional_roots)?;
         let keep_open = discovery.candidates.len() <= config.max_open_files;
-        let mut files = Vec::new(); let mut errors = Vec::new(); let mut excluded = Vec::new();
+        let mut files = Vec::new();
         let mut seen = HashSet::new();
         for path in discovery.candidates {
             if let Some(identity) = deferred.iter().find(|identity| identity.defers(&path)) {
-                excluded.push(identity.clone()); continue;
+                excluded.push(identity.clone());
+                continue;
             }
             match JournalFile::open(path.clone(), &config) {
                 Ok(file) => {
-                    if !seen.insert(file.file_id()) { continue; }
+                    if !seen.insert(file.file_id()) {
+                        continue;
+                    }
                     let info = JournalFileInfo {
-                        path: file.path().to_owned(), file_id: file.file_id(), seqnum_id: file.seqnum_id(),
-                        entry_range: None, entry_range_known: false, used_size: file.used_size(),
-                        #[cfg(unix)] file_identity: file.file_identity(),
-                        file: if keep_open { file } else { file.reopen_snapshot() }, keep_open,
+                        path: file.path().to_owned(),
+                        file_id: file.file_id(),
+                        seqnum_id: file.seqnum_id(),
+                        entry_range: None,
+                        entry_range_known: false,
+                        used_size: file.used_size(),
+                        #[cfg(unix)]
+                        file_identity: file.file_identity(),
+                        file: if keep_open {
+                            file
+                        } else {
+                            file.reopen_snapshot()
+                        },
+                        keep_open,
                     };
                     files.push(info);
                 }
@@ -97,14 +133,23 @@ impl Journal {
                 Err(error) => errors.push((path, error)),
             }
         }
-        Ok(Self { inner: Arc::new(JournalInner {
-            #[cfg(unix)] reader_cache: crate::file::ReaderCache::new(&config),
-            config, roots: discovery.roots, file_infos: files, open_errors: errors, deferred: excluded,
-        }) })
+        Ok(Self {
+            inner: Arc::new(JournalInner {
+                #[cfg(unix)]
+                reader_cache: crate::file::ReaderCache::new(&config),
+                config,
+                roots: discovery.roots,
+                file_infos: files,
+                open_errors: errors,
+                deferred: excluded,
+            }),
+        })
     }
 
     /// Candidates actually omitted by this pass's explicit deferred-owner policy.
-    pub fn deferred_files(&self) -> &[crate::FileIdentity] { &self.inner.deferred }
+    pub fn deferred_files(&self) -> &[crate::FileIdentity] {
+        &self.inner.deferred
+    }
 
     /// Open the default system journal roots on Linux.
     ///
@@ -476,6 +521,117 @@ fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jou
     Ok(JournalFileSet { file_infos, errors })
 }
 
+struct ProgressDiscovery {
+    discovery: JournalDiscovery,
+    errors: Vec<(PathBuf, SdJournalError)>,
+    excluded: Vec<crate::FileIdentity>,
+}
+
+// Unlike the legacy query opener, a positioned catalog must distinguish a clean
+// empty root from a failed directory and retain every bounded discovery failure.
+fn discover_progress_candidates(
+    paths: &[PathBuf],
+    config: &JournalConfig,
+    deferred: &[crate::FileIdentity],
+    optional_roots: bool,
+) -> Result<ProgressDiscovery> {
+    if paths.is_empty() {
+        return Err(SdJournalError::InvalidQuery {
+            reason: "open_dirs requires at least one path".into(),
+        });
+    }
+    let mut roots = paths.to_vec();
+    roots.sort();
+    roots.dedup();
+    if roots.len() > config.max_journal_files {
+        return Err(discovery_limit(config));
+    }
+    let mut directories: Vec<_> = roots.iter().cloned().map(|path| (path, true)).collect();
+    let mut candidates = Vec::new();
+    let mut errors = Vec::new();
+    let mut excluded = Vec::new();
+    while let Some((path, root)) = directories.pop() {
+        if let Some(identity) = deferred.iter().find(|identity| identity.defers(&path)) {
+            excluded.push(identity.clone());
+            continue;
+        }
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // The two standard roots are alternatives, not required paths.
+                if optional_roots && root && error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                errors.push((
+                    path.clone(),
+                    SdJournalError::io("read_dir", Some(path), error),
+                ));
+                if errors.len() > config.max_journal_files {
+                    return Err(discovery_limit(config));
+                }
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push((
+                        path.clone(),
+                        SdJournalError::io("read_dir_entry", Some(path.clone()), error),
+                    ));
+                    if errors.len() > config.max_journal_files {
+                        return Err(discovery_limit(config));
+                    }
+                    continue;
+                }
+            };
+            let entry_path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    errors.push((
+                        entry_path.clone(),
+                        SdJournalError::io("file_type", Some(entry_path), error),
+                    ));
+                    if errors.len() > config.max_journal_files {
+                        return Err(discovery_limit(config));
+                    }
+                    continue;
+                }
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if root && kind.is_dir() && is_machine_id_dir(&entry.file_name()) {
+                directories.push((entry_path, false));
+            } else if kind.is_file() && is_journal_file(&entry_path, config) {
+                candidates.push(entry_path);
+            }
+            if candidates.len().saturating_add(directories.len()) > config.max_journal_files {
+                return Err(discovery_limit(config));
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len().saturating_add(errors.len()) > config.max_journal_files {
+        return Err(discovery_limit(config));
+    }
+    Ok(ProgressDiscovery {
+        discovery: JournalDiscovery { roots, candidates },
+        errors,
+        excluded,
+    })
+}
+
+fn discovery_limit(config: &JournalConfig) -> SdJournalError {
+    SdJournalError::LimitExceeded {
+        kind: LimitKind::JournalFiles,
+        limit: u64::try_from(config.max_journal_files).unwrap_or(u64::MAX),
+    }
+}
+
 pub(crate) fn discover_journal_candidates(
     paths: &[PathBuf],
     config: &JournalConfig,
@@ -613,6 +769,23 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/support/synthetic_journal.rs"
         ));
+    }
+
+    #[test]
+    fn default_progress_roots_allow_absence_but_explicit_roots_do_not() {
+        let root = tempdir().unwrap();
+        let missing = root.path().join("absent");
+        let optional = Journal::open_progress_dirs_impl(
+            std::slice::from_ref(&missing),
+            JournalConfig::default(),
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(optional.open_errors().is_empty());
+        let explicit =
+            Journal::open_progress_dirs(&[missing], JournalConfig::default(), &[]).unwrap();
+        assert_eq!(explicit.open_errors().len(), 1);
     }
 
     #[cfg(unix)]

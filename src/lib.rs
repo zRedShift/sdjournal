@@ -100,8 +100,8 @@ mod file;
 mod format;
 mod journal;
 mod live;
-mod query;
 mod progress;
+mod query;
 mod reader;
 #[cfg(feature = "verify-seal")]
 mod seal;
@@ -116,6 +116,9 @@ pub use crate::{
     error::{CompressionAlgo, LimitKind, Result, RetirementReason, SdJournalError},
     journal::Journal,
     live::{LiveFilter, LiveJournal, LiveOrGroupBuilder, LiveSubscription, SubscriptionOptions},
+    progress::{
+        DataCacheConfig, DataCacheStats, FileBoundary, FileIdentity, FilePosition, PositionedScan,
+        ScanItem, ScanOptions,
+    },
     query::JournalQuery,
-    progress::{FilePosition, FileIdentity, FileBoundary, DataCacheConfig, DataCacheStats, ScanOptions, ScanItem, PositionedScan},
 };
