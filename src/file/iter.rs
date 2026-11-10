@@ -14,6 +14,7 @@ struct EntryArrayDescriptor {
     used_items: usize,
     first: u64,
     last: u64,
+    prefix_items: u64,
 }
 
 struct EntryArrayCursor {
@@ -25,6 +26,8 @@ struct EntryArrayCursor {
     current_items: VecDeque<u64>,
     previous_offset: Option<u64>,
     first_refill_single: bool,
+    next_ordinal: u64,
+    last_ordinal: u64,
     exhausted: bool,
 }
 
@@ -50,6 +53,8 @@ impl EntryArrayCursor {
             current_items: VecDeque::new(),
             previous_offset: None,
             first_refill_single: false,
+            next_ordinal: 0,
+            last_ordinal: 0,
             exhausted,
         }
     }
@@ -79,6 +84,8 @@ impl EntryArrayCursor {
             // A lazy query normally asks this cursor for one item and then drops it. Reading just
             // that item avoids re-reading an overlapping 4 KiB suffix chunk for every entry.
             first_refill_single: true,
+            next_ordinal: 0,
+            last_ordinal: 0,
             exhausted: false,
         };
         cursor.skip_exhausted_array();
@@ -148,6 +155,7 @@ impl EntryArrayCursor {
             items_per_chunk,
         );
         let mut items = read_entry_array_item_range(&self.file, &array, start, end)?;
+        self.next_ordinal = array.prefix_items + if self.reverse { end as u64 } else { start as u64 + 1 };
         self.next_item_idx = if self.reverse { start } else { end };
         if self.reverse {
             items.reverse();
@@ -190,6 +198,8 @@ impl Iterator for EntryArrayCursor {
                 return Some(Err(error));
             }
             if let Some(offset) = self.current_items.pop_front() {
+                self.last_ordinal = self.next_ordinal;
+                self.next_ordinal = if self.reverse { self.next_ordinal.saturating_sub(1) } else { self.next_ordinal.saturating_add(1) };
                 return Some(Ok(offset));
             }
             self.skip_exhausted_array();
@@ -337,6 +347,45 @@ pub(crate) struct FileEntryIter {
 }
 
 impl FileEntryIter {
+    pub(crate) fn positioned(file: JournalFile, position: Option<&crate::FilePosition>) -> Result<(Self, Option<u64>)> {
+        file.validate_snapshot()?;
+        let descriptors = collect_entry_array_descriptors(&file, file.inner.header.entry_array_offset, file.inner.header.n_entries, false)?;
+        let mut matched = None;
+        if let Some(position) = position {
+            let array_index = descriptors.partition_point(|array| array.last < position.entry_offset);
+            if let Some(array) = descriptors.get(array_index)
+                && array.first <= position.entry_offset {
+                let split = partition_point_result(array.used_items, |index| {
+                    Ok(read_entry_array_item(&file, array.offset, &array.layout, index)? < position.entry_offset)
+                })?;
+                if split < array.used_items
+                    && read_entry_array_item(&file, array.offset, &array.layout, split)? == position.entry_offset {
+                    let ordinal = array.prefix_items + split as u64 + 1;
+                    match file.read_entry_meta(position.entry_offset) {
+                        Ok(meta) if position.matches(&meta) && (position.ordinal == 0 || position.ordinal == ordinal) => matched = Some(ordinal),
+                        Err(error @ SdJournalError::Retired { .. }) => return Err(error),
+                        Err(error @ (SdJournalError::Io { .. } | SdJournalError::PermissionDenied { .. } | SdJournalError::Transient { .. })) => return Err(error),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let arrays = if matched.is_some() {
+            EntryArrayCursor::new_after_offset(file.clone(), descriptors, false, position.map_or(0, |p| p.entry_offset))?
+        } else { EntryArrayCursor::new(file.clone(), descriptors, false) };
+        file.validate_snapshot()?;
+        Ok((Self { file, arrays, exhausted: false }, matched))
+    }
+
+    pub(crate) fn next_slot(&mut self) -> Option<Result<(u64, u64)>> {
+        if self.exhausted { return None; }
+        match self.arrays.next() {
+            Some(Ok(offset)) => Some(Ok((offset, self.arrays.last_ordinal))),
+            Some(Err(error)) => { self.exhausted = true; Some(Err(error)) }
+            None => { self.exhausted = true; None }
+        }
+    }
+
     pub(crate) fn new_with_seek_realtime(
         file: JournalFile,
         reverse: bool,
@@ -505,6 +554,7 @@ fn collect_entry_array_descriptors(
                 used_items,
                 first,
                 last,
+                prefix_items: expected_items - remaining,
             });
             remaining = remaining.saturating_sub(u64::try_from(used_items).unwrap_or(u64::MAX));
         }
@@ -596,6 +646,7 @@ fn validate_entry_array_prefix(
         used_items: nominal_used,
         first: 0,
         last: 0,
+        prefix_items: 0,
     };
     let items_per_chunk = (ENTRY_ARRAY_CHUNK_BYTES / layout.item_size).max(1);
     let mut validated = 0usize;

@@ -32,6 +32,7 @@ pub(crate) struct JournalInner {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) file_infos: Vec<JournalFileInfo>,
     pub(crate) open_errors: Vec<(PathBuf, SdJournalError)>,
+    pub(crate) deferred: Vec<crate::FileIdentity>,
 }
 
 #[derive(Clone)]
@@ -41,7 +42,7 @@ pub(crate) struct JournalFileInfo {
     pub(crate) seqnum_id: [u8; 16],
     pub(crate) entry_range: Option<EntryRange>,
     pub(crate) entry_range_known: bool,
-    file: JournalFile,
+    pub(crate) file: JournalFile,
     keep_open: bool,
     used_size: u64,
     #[cfg(unix)]
@@ -54,6 +55,57 @@ pub(crate) struct JournalDiscovery {
 }
 
 impl Journal {
+    /// Discover default roots for positioned collection, preserving failed/empty
+    /// catalogs. Inspect [`Journal::open_errors`] and [`Journal::deferred_files`].
+    pub fn open_progress_default(config: JournalConfig, deferred: &[crate::FileIdentity]) -> Result<Self> {
+        core::cfg_select! {
+            target_os = "linux" => {
+                Self::open_progress_dirs(&[PathBuf::from("/run/log/journal"), PathBuf::from("/var/log/journal")], config, deferred)
+            }
+            _ => { let _ = (config, deferred); Err(SdJournalError::Unsupported { reason: "default journals require Linux".into() }) }
+        }
+    }
+
+    /// Open a best-effort positioned-scan catalog, retaining all initial errors.
+    /// A deferred path with a positively different inode remains eligible.
+    /// Unlike ordinary open, zero usable files is a valid (possibly failed) catalog.
+    pub fn open_progress_dirs(paths: &[PathBuf], config: JournalConfig, deferred: &[crate::FileIdentity]) -> Result<Self> {
+        validate_journal_config(&config)?;
+        if deferred.len() > config.max_journal_files {
+            return Err(SdJournalError::LimitExceeded { kind: LimitKind::JournalFiles, limit: config.max_journal_files as u64 });
+        }
+        let discovery = discover_journal_candidates(paths, &config)?;
+        let keep_open = discovery.candidates.len() <= config.max_open_files;
+        let mut files = Vec::new(); let mut errors = Vec::new(); let mut excluded = Vec::new();
+        let mut seen = HashSet::new();
+        for path in discovery.candidates {
+            if let Some(identity) = deferred.iter().find(|identity| identity.defers(&path)) {
+                excluded.push(identity.clone()); continue;
+            }
+            match JournalFile::open(path.clone(), &config) {
+                Ok(file) => {
+                    if !seen.insert(file.file_id()) { continue; }
+                    let info = JournalFileInfo {
+                        path: file.path().to_owned(), file_id: file.file_id(), seqnum_id: file.seqnum_id(),
+                        entry_range: None, entry_range_known: false, used_size: file.used_size(),
+                        #[cfg(unix)] file_identity: file.file_identity(),
+                        file: if keep_open { file } else { file.reopen_snapshot() }, keep_open,
+                    };
+                    files.push(info);
+                }
+                Err(error @ SdJournalError::Retired { .. }) => return Err(error),
+                Err(error) => errors.push((path, error)),
+            }
+        }
+        Ok(Self { inner: Arc::new(JournalInner {
+            #[cfg(unix)] reader_cache: crate::file::ReaderCache::new(&config),
+            config, roots: discovery.roots, file_infos: files, open_errors: errors, deferred: excluded,
+        }) })
+    }
+
+    /// Candidates actually omitted by this pass's explicit deferred-owner policy.
+    pub fn deferred_files(&self) -> &[crate::FileIdentity] { &self.inner.deferred }
+
     /// Open the default system journal roots on Linux.
     ///
     /// This scans `/run/log/journal` and `/var/log/journal`, opens any discovered journal files,
@@ -142,6 +194,7 @@ impl Journal {
                 roots: discovery.roots,
                 file_infos: file_set.file_infos,
                 open_errors: file_set.errors,
+                deferred: Vec::new(),
             }),
         })
     }
@@ -334,6 +387,7 @@ pub(crate) fn journal_from_snapshot_files(
             roots,
             file_infos,
             open_errors: Vec::new(),
+            deferred: Vec::new(),
         }),
     })
 }

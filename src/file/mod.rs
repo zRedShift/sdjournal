@@ -87,6 +87,45 @@ pub(super) fn snapshot_open_error(path: &Path, error: std::io::Error) -> SdJourn
 }
 
 impl JournalFile {
+    pub(crate) fn with_progress_boundary(&self, boundary: &crate::FileBoundary) -> Result<Self> {
+        let identity = crate::FileIdentity::from_file(self);
+        if boundary.file.file_id != Some(self.file_id()) || boundary.file.device != identity.device || boundary.file.inode != identity.inode {
+            return Err(SdJournalError::Retired { path: self.path().to_owned(), reason: crate::RetirementReason::Replaced });
+        }
+        self.validate_snapshot()?;
+        if self.inner.used_size < boundary.used_size {
+            return Err(SdJournalError::Transient { path: Some(self.path().to_owned()), reason: "original file boundary is no longer available".into() });
+        }
+        Ok(Self { inner: Arc::new(JournalFileInner {
+            path: self.inner.path.clone(), config: self.inner.config.clone(), header: boundary.header.clone(),
+            used_size: boundary.used_size, file_len: self.inner.file_len, modified_at_open: self.inner.modified_at_open,
+            #[cfg(unix)] file_identity: self.inner.file_identity,
+            access: self.inner.access.clone(),
+        }) })
+    }
+
+    pub(crate) fn position_is_stable_tail(&self, position: &crate::FilePosition) -> Result<bool> {
+        if self.inner.header.tail_entry_offset != Some(position.entry_offset)
+            || self.inner.header.n_entries != position.ordinal
+            || self.inner.header.tail_entry_seqnum != Some(position.seqnum) { return Ok(false); }
+        self.validate_snapshot()?;
+        let result = (|| {
+            let before = self.read_bytes(0, 272)?;
+            let header = Header::parse(before.as_slice(), self.path())?;
+            if header.file_id != position.file_id || header.seqnum_id != position.seqnum_id
+                || header.n_entries != position.ordinal || header.tail_entry_offset != Some(position.entry_offset)
+                || header.tail_entry_seqnum != Some(position.seqnum)
+                || header.tail_object_offset != self.inner.header.tail_object_offset { return Ok(false); }
+            let meta = self.read_entry_meta(position.entry_offset)?;
+            let after = self.read_bytes(0, 272)?;
+            if before.as_slice() != after.as_slice() {
+                return Err(SdJournalError::Transient { path: Some(self.path().to_owned()), reason: "journal tail changed during EOF witness".into() });
+            }
+            Ok(position.matches(&meta))
+        })();
+        self.finish_snapshot_read(result)
+    }
+
     /// Validate the actual owner at publication boundaries, never per DATA field.
     /// mmap still requires the caller's stable-file contract: a stat check does
     /// not protect a mapping against concurrent truncation. Use Never for live

@@ -9,6 +9,14 @@ use crate::util::is_ascii_field_name;
 
 use self::execute::JournalIter;
 
+pub(crate) fn resolve_anchor(query: &JournalQuery) -> Result<Option<crate::file::EntryMeta>> {
+    Ok(cursor::build_cursor_start(query)?.and_then(|start| start.exact_meta()))
+}
+
+pub(crate) fn meta_key(meta: &crate::file::EntryMeta) -> crate::cursor::SdJournalEntryKey {
+    cursor::entry_key_from_meta(meta)
+}
+
 #[derive(Debug, Clone)]
 enum MatchTerm {
     Exact { payload: Vec<u8>, eq_pos: usize },
@@ -562,6 +570,7 @@ mod tests {
                 roots: Vec::new(),
                 file_infos: Vec::new(),
                 open_errors: Vec::new(),
+                deferred: Vec::new(),
             }),
         }
     }

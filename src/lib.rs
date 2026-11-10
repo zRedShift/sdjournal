@@ -101,6 +101,7 @@ mod format;
 mod journal;
 mod live;
 mod query;
+mod progress;
 mod reader;
 #[cfg(feature = "verify-seal")]
 mod seal;
@@ -116,4 +117,5 @@ pub use crate::{
     journal::Journal,
     live::{LiveFilter, LiveJournal, LiveOrGroupBuilder, LiveSubscription, SubscriptionOptions},
     query::JournalQuery,
+    progress::{FilePosition, FileIdentity, FileBoundary, DataCacheConfig, DataCacheStats, ScanOptions, ScanItem, PositionedScan},
 };

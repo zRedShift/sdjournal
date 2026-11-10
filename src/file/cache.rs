@@ -307,6 +307,15 @@ impl CachedAccess {
         snapshot: &JournalFile,
         offset: u64,
     ) -> Result<crate::EntryRef> {
+        self.read_entry_with_cache(snapshot, offset, None)
+    }
+
+    pub(super) fn read_entry_with_cache(
+        &self,
+        snapshot: &JournalFile,
+        offset: u64,
+        cache: Option<&mut crate::progress::PayloadCache>,
+    ) -> Result<crate::EntryRef> {
         let mut entries = self
             .cache
             .entries
@@ -339,7 +348,7 @@ impl CachedAccess {
             let decoded = {
                 let direct = snapshot.with_direct_access(reader.access.clone());
                 direct
-                    .read_entry_ref_inner(offset)
+                    .read_entry_ref_inner_with_cache(offset, cache)
                     .map(crate::EntryRef::into_owned_payloads)
             }; // All temporary map/FD aliases die while the cache remains locked.
             #[cfg(test)]
