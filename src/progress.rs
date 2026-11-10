@@ -342,6 +342,7 @@ pub struct PositionedScan {
     files: Vec<FileScan>,
     notices: VecDeque<ScanItem>,
     cache: Option<PayloadCache>,
+    prime_round: bool,
     done: bool,
 }
 
@@ -475,6 +476,7 @@ impl Journal {
             files: Vec::new(),
             notices: VecDeque::new(),
             cache: options.snapshot_cache.map(PayloadCache::new),
+            prime_round: true,
             done: false,
         };
         if let Some(boundaries) = &options.boundaries {
@@ -680,14 +682,21 @@ impl Iterator for PositionedScan {
         if self.done {
             return None;
         }
-        for index in 0..self.files.len() {
-            if let Err(error) = self.prime(index)
-                && let Err(error) = self.report_owner_error(self.files[index].owner_index, error)
-            {
-                self.done = true;
-                self.notices.clear();
-                return Some(Err(error));
+        // A round admits at most one slot per owner. After its bounded
+        // notices drain, a ready peer gets a turn before another unknown
+        // corrupt head is probed. Healthy heads still use the same comparator.
+        if self.prime_round || !self.files.iter().any(|file| file.next.is_some()) {
+            for index in 0..self.files.len() {
+                if let Err(error) = self.prime(index)
+                    && let Err(error) =
+                        self.report_owner_error(self.files[index].owner_index, error)
+                {
+                    self.done = true;
+                    self.notices.clear();
+                    return Some(Err(error));
+                }
             }
+            self.prime_round = false;
             if let Some(notice) = self.notices.pop_front() {
                 return Some(Ok(notice));
             }
@@ -722,6 +731,7 @@ impl Iterator for PositionedScan {
             self.done = true;
             return None;
         };
+        self.prime_round = true;
         let position = FilePosition::from_meta(meta, ordinal);
         let result = self.files[index]
             .file

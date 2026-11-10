@@ -821,3 +821,99 @@ fn unlink_during_eof_priming_remains_global_retirement() {
         ));
     }
 }
+
+#[test]
+fn corrupt_header_round_admits_healthy_peer_before_repriming_unknown_head() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("a.journal");
+        write_synthetic_journal_file(&victim, &["bad", "bad", "bad", "good-a-tail"], 7);
+        write_synthetic_journal_file(
+            &root.path().join("b.journal"),
+            &["healthy-b", "healthy-b"],
+            8,
+        );
+        for offset in offsets(&victim).into_iter().take(3) {
+            write(&victim, offset, &[0]);
+        }
+        let journal = open(root.path(), budget);
+        let mut scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap();
+        assert!(matches!(
+            scan.next().unwrap().unwrap(),
+            ScanItem::Omitted {
+                ordinal: 1,
+                position: None,
+                ..
+            }
+        ));
+        let next = scan.next().unwrap().unwrap();
+        assert!(
+            matches!(&next, ScanItem::Entry { entry, .. } if entry.get("MESSAGE").unwrap().ends_with(b"healthy-b")),
+            "ready B must follow the bounded first omission round, before A is primed again: {next:?}"
+        );
+        let mut b_count = 1;
+        let mut a_count = 0;
+        let mut omitted = 1;
+        for item in scan {
+            match item.unwrap() {
+                ScanItem::Entry {
+                    entry, position, ..
+                } if entry.get("MESSAGE").unwrap().ends_with(b"good-a-tail") => {
+                    assert_eq!(position.ordinal, 4);
+                    a_count += 1;
+                }
+                ScanItem::Entry { entry, .. } => {
+                    assert!(entry.get("MESSAGE").unwrap().ends_with(b"healthy-b"));
+                    b_count += 1;
+                }
+                ScanItem::Omitted { position: None, .. } => omitted += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!((a_count, b_count, omitted), (1, 2, 3));
+    }
+}
+
+#[test]
+fn corrupt_header_round_preserves_an_already_prefetched_healthy_peer() {
+    for budget in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("a.journal");
+        write_synthetic_journal_file(&victim, &["good-a-head", "bad", "bad", "good-a-tail"], 7);
+        write_synthetic_journal_file(&root.path().join("b.journal"), &["healthy-b"], 8);
+        for offset in offsets(&victim).into_iter().skip(1).take(2) {
+            write(&victim, offset, &[0]);
+        }
+        let journal = open(root.path(), budget);
+        let mut scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap();
+        assert!(
+            matches!(scan.next().unwrap().unwrap(), ScanItem::Entry { entry, .. } if entry.get("MESSAGE").unwrap().ends_with(b"good-a-head"))
+        );
+        assert!(matches!(
+            scan.next().unwrap().unwrap(),
+            ScanItem::Omitted {
+                ordinal: 2,
+                position: None,
+                ..
+            }
+        ));
+        let next = scan.next().unwrap().unwrap();
+        assert!(
+            matches!(&next, ScanItem::Entry { entry, .. } if entry.get("MESSAGE").unwrap().ends_with(b"healthy-b")),
+            "prefetched B cannot be starved by A's next unknown slot: {next:?}"
+        );
+        let remaining = scan.collect::<sdjournal::Result<Vec<_>>>().unwrap();
+        assert!(remaining.iter().any(|item| matches!(item, ScanItem::Entry { entry, position, .. } if position.ordinal == 4 && entry.get("MESSAGE").unwrap().ends_with(b"good-a-tail"))));
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|item| matches!(item, ScanItem::Omitted { position: None, .. }))
+                .count(),
+            1
+        );
+    }
+}
