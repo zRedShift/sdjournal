@@ -240,7 +240,12 @@ impl CachedReader {
             self.access = Access::File(FileAccess::new(self.path.clone(), Arc::clone(&self.file)));
             return Err(transient(&self.path, "file was truncated while reading"));
         }
-        self.prepare_access(state, file_len, config)?;
+        self.prepare_access(
+            state,
+            file_len,
+            config,
+            !snapshot.template.disposed_recovery(),
+        )?;
         let bytes = match &self.access {
             Access::File(reader) => reader.read_known_valid(offset, len)?,
             #[cfg(feature = "mmap")]
@@ -256,10 +261,17 @@ impl CachedReader {
         }
     }
 
-    fn prepare_access(&mut self, state: u8, file_len: u64, config: &JournalConfig) -> Result<()> {
+    fn prepare_access(
+        &mut self,
+        state: u8,
+        file_len: u64,
+        config: &JournalConfig,
+        allow_mmap: bool,
+    ) -> Result<()> {
         #[cfg(feature = "mmap")]
         {
-            let allow_map = matches!(config.mmap_policy, crate::config::MmapPolicy::Auto)
+            let allow_map = allow_mmap
+                && matches!(config.mmap_policy, crate::config::MmapPolicy::Auto)
                 && (state != crate::format::STATE_ONLINE || config.allow_mmap_online);
             if !allow_map {
                 self.access =
@@ -281,7 +293,7 @@ impl CachedReader {
             }
         }
         #[cfg(not(feature = "mmap"))]
-        let _ = (state, file_len, config);
+        let _ = (state, file_len, config, allow_mmap);
         Ok(())
     }
 }
@@ -344,7 +356,12 @@ impl CachedAccess {
             if file_len < snapshot.inner.used_size {
                 return Err(transient(&self.path, "file was truncated while reading"));
             }
-            reader.prepare_access(state, file_len, &self.cache.config)?;
+            reader.prepare_access(
+                state,
+                file_len,
+                &self.cache.config,
+                !snapshot.disposed_recovery(),
+            )?;
             let decoded = {
                 let direct = snapshot.with_direct_access(reader.access.clone());
                 direct

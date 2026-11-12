@@ -185,7 +185,9 @@ impl EntryArrayCursor {
         }
 
         for &offset in &items {
-            if let Some(previous) = self.previous_offset {
+            if !self.file.disposed_recovery()
+                && let Some(previous) = self.previous_offset
+            {
                 let valid = if self.reverse {
                     offset < previous
                 } else {
@@ -200,7 +202,9 @@ impl EntryArrayCursor {
                     ));
                 }
             }
-            self.previous_offset = Some(offset);
+            if !self.file.disposed_recovery() {
+                self.previous_offset = Some(offset);
+            }
         }
 
         self.current_items = items.into();
@@ -221,6 +225,17 @@ impl Iterator for EntryArrayCursor {
                 return Some(Err(error));
             }
             if let Some(offset) = self.current_items.pop_front() {
+                if self.file.disposed_recovery() && offset == 0 {
+                    self.exhausted = true;
+                    self.current_items.clear();
+                    return Some(Err(self.file.metadata_error(
+                        Some(
+                            self.arrays[usize::try_from(self.current_array_idx).unwrap_or(0)]
+                                .offset,
+                        ),
+                        "ENTRY_ARRAY reached a zero slot before a trusted terminal frontier",
+                    )));
+                }
                 self.last_ordinal = self.next_ordinal;
                 self.next_ordinal = if self.reverse {
                     self.next_ordinal.saturating_sub(1)
@@ -375,11 +390,16 @@ pub(crate) struct FileEntryIter {
     file: JournalFile,
     arrays: EntryArrayCursor,
     terminal: Option<SdJournalError>,
+    last_valid_offset: Option<u64>,
+    reverse: bool,
     exhausted: bool,
 }
 
 impl FileEntryIter {
     pub(crate) fn has_remaining_slots(&self) -> bool {
+        if self.terminal.is_some() {
+            return true;
+        }
         if self.exhausted || self.arrays.exhausted && self.terminal.is_none() {
             return false;
         }
@@ -411,61 +431,86 @@ impl FileEntryIter {
         let mut matched = None;
         let mut matched_split = None;
         if let Some(position) = position {
-            let array_index =
-                descriptors.partition_point(|array| array.last < position.entry_offset);
-            if let Some(array) = descriptors.get(array_index)
-                && array.first <= position.entry_offset
+            let candidate = if file.disposed_recovery() && position.ordinal != 0 {
+                let target = position.ordinal - 1;
+                descriptors
+                    .iter()
+                    .enumerate()
+                    .find_map(|(array_index, array)| {
+                        let end = array.prefix_items.saturating_add(array.used_items as u64);
+                        (target >= array.prefix_items && target < end).then(|| {
+                            let index =
+                                usize::try_from(target - array.prefix_items).unwrap_or(usize::MAX);
+                            (array_index, index, position.ordinal)
+                        })
+                    })
+            } else {
+                let array_index =
+                    descriptors.partition_point(|array| array.last < position.entry_offset);
+                descriptors
+                    .get(array_index)
+                    .and_then(|array| {
+                        (array.first <= position.entry_offset).then_some((array_index, array))
+                    })
+                    .map(|(array_index, array)| {
+                        let split = partition_point_result(array.used_items, |index| {
+                            Ok(
+                                read_entry_array_item(&file, array.offset, &array.layout, index)?
+                                    < position.entry_offset,
+                            )
+                        })?;
+                        Ok::<_, SdJournalError>((
+                            array_index,
+                            split,
+                            array.prefix_items + split as u64 + 1,
+                        ))
+                    })
+                    .transpose()?
+            };
+            if let Some((array_index, split, ordinal)) = candidate
+                && let Some(array) = descriptors.get(array_index)
+                && split < array.used_items
+                && read_entry_array_item(&file, array.offset, &array.layout, split)?
+                    == position.entry_offset
             {
-                let split = partition_point_result(array.used_items, |index| {
-                    Ok(
-                        read_entry_array_item(&file, array.offset, &array.layout, index)?
-                            < position.entry_offset,
-                    )
-                })?;
-                if split < array.used_items
-                    && read_entry_array_item(&file, array.offset, &array.layout, split)?
-                        == position.entry_offset
-                {
-                    let ordinal = array.prefix_items + split as u64 + 1;
-                    match file.read_entry_meta(position.entry_offset) {
-                        Ok(meta)
-                            if position.matches(&meta)
-                                && (position.ordinal == 0 || position.ordinal == ordinal) =>
-                        {
-                            if ordinal == file.inner.header.n_entries
-                                && (file
+                match file.read_entry_meta(position.entry_offset) {
+                    Ok(meta)
+                        if position.matches(&meta)
+                            && (position.ordinal == 0 || position.ordinal == ordinal) =>
+                    {
+                        if ordinal == file.inner.header.n_entries
+                            && (file
+                                .inner
+                                .header
+                                .tail_entry_seqnum
+                                .is_some_and(|seq| seq != meta.seqnum)
+                                || file
                                     .inner
                                     .header
-                                    .tail_entry_seqnum
-                                    .is_some_and(|seq| seq != meta.seqnum)
-                                    || file
-                                        .inner
-                                        .header
-                                        .tail_entry_offset
-                                        .is_some_and(|tail| tail != meta.entry_offset))
-                            {
-                                return Err(SdJournalError::Transient {
-                                    path: Some(file.path().to_owned()),
-                                    reason: "contradictory committed tail identity".into(),
-                                });
-                            }
-                            matched = Some(ordinal);
-                            matched_split = Some((array_index, split + 1));
+                                    .tail_entry_offset
+                                    .is_some_and(|tail| tail != meta.entry_offset))
+                        {
+                            return Err(SdJournalError::Transient {
+                                path: Some(file.path().to_owned()),
+                                reason: "contradictory committed tail identity".into(),
+                            });
                         }
-                        Err(error @ SdJournalError::Retired { .. }) => return Err(error),
-                        Err(
-                            error @ (SdJournalError::Io { .. }
-                            | SdJournalError::PermissionDenied { .. }
-                            | SdJournalError::Transient { .. }),
-                        ) => return Err(error),
-                        _ => {}
+                        matched = Some(ordinal);
+                        matched_split = Some((array_index, split + 1));
                     }
+                    Err(error @ SdJournalError::Retired { .. }) => return Err(error),
+                    Err(
+                        error @ (SdJournalError::Io { .. }
+                        | SdJournalError::PermissionDenied { .. }
+                        | SdJournalError::Transient { .. }),
+                    ) => return Err(error),
+                    _ => {}
                 }
             }
         }
         let arrays = if let Some((array_index, split)) = matched_split {
-            // The descriptor prefix already validated strict slot ordering and
-            // the search above proved this exact member. Reuse its successor.
+            // The exact ordinal and entry identity proved this member. Reuse
+            // its successor without rereading acknowledged history.
             EntryArrayCursor::from_validated_split(
                 file.clone(),
                 descriptors,
@@ -483,6 +528,9 @@ impl FileEntryIter {
                 file,
                 arrays,
                 terminal: plan.terminal,
+                last_valid_offset: matched
+                    .map(|_| position.map_or(0, |position| position.entry_offset)),
+                reverse: false,
                 exhausted: false,
             },
             matched,
@@ -510,6 +558,27 @@ impl FileEntryIter {
         }
     }
 
+    pub(crate) fn accept_valid_offset(&mut self, offset: u64) -> Result<()> {
+        let invalid_order = self.last_valid_offset.is_some_and(|previous| {
+            if self.reverse {
+                offset >= previous
+            } else {
+                offset <= previous
+            }
+        });
+        if self.file.disposed_recovery() && invalid_order {
+            return Err(self.file.metadata_error(
+                Some(offset),
+                format!(
+                    "ENTRY_ARRAY entry offsets violate scan order ({offset} vs {})",
+                    self.last_valid_offset.unwrap_or(0)
+                ),
+            ));
+        }
+        self.last_valid_offset = Some(offset);
+        Ok(())
+    }
+
     pub(crate) fn new_with_seek_realtime(
         file: JournalFile,
         reverse: bool,
@@ -527,6 +596,8 @@ impl FileEntryIter {
             file,
             arrays,
             terminal: plan.terminal,
+            last_valid_offset: None,
+            reverse,
             exhausted: false,
         })
     }
@@ -542,17 +613,23 @@ impl FileEntryIter {
             file.inner.header.n_entries,
             false,
         )?;
-        let arrays = EntryArrayCursor::new_after_offset(
-            file.clone(),
-            plan.arrays,
-            reverse,
-            after_entry_offset,
-        )?;
+        let arrays = if file.disposed_recovery() {
+            EntryArrayCursor::new(file.clone(), plan.arrays, reverse)
+        } else {
+            EntryArrayCursor::new_after_offset(
+                file.clone(),
+                plan.arrays,
+                reverse,
+                after_entry_offset,
+            )?
+        };
 
         Ok(Self {
             file,
             arrays,
             terminal: plan.terminal,
+            last_valid_offset: None,
+            reverse,
             exhausted: false,
         })
     }
@@ -576,7 +653,13 @@ impl Iterator for FileEntryIter {
             return None;
         }
         match self.arrays.next() {
-            Some(Ok(entry_offset)) => Some(self.file.read_entry_meta(entry_offset)),
+            Some(Ok(entry_offset)) => match self.file.read_entry_meta(entry_offset) {
+                Ok(meta) => match self.accept_valid_offset(entry_offset) {
+                    Ok(()) => Some(Ok(meta)),
+                    Err(error) => Some(Err(error)),
+                },
+                Err(error) => Some(Err(error)),
+            },
             None => {
                 if let Some(error) = self.terminal.take() {
                     Some(Err(error))
@@ -643,13 +726,22 @@ fn collect_entry_array_descriptors(
     let mut previous_last = None;
     let mut remaining = expected_items;
     let mut terminal = None;
+    let frontier_recovery = file.disposed_recovery() && !allow_online_snapshot_truncate;
+    let mut recover_unknown_tail = false;
+    let mut indexed_items = 0u64;
 
     while current != 0 {
         if !visited.insert(current) {
-            return Err(file.metadata_error(
+            let error = file.metadata_error(
                 Some(current),
                 format!("cycle detected in ENTRY_ARRAY chain at offset {current}"),
-            ));
+            );
+            if frontier_recovery {
+                terminal = Some(error);
+                remaining = 0;
+                break;
+            }
+            return Err(error);
         }
         if arrays.len() >= file.inner.config.max_object_chain_steps {
             return Err(SdJournalError::LimitExceeded {
@@ -665,34 +757,61 @@ fn collect_entry_array_descriptors(
                 remaining = 0;
                 break;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let error = file.classify_disposed_error(Some(current), error);
+                if frontier_recovery && matches!(error, SdJournalError::PermanentDisposed { .. }) {
+                    terminal = Some(error);
+                    remaining = 0;
+                    break;
+                }
+                return Err(error);
+            }
         };
         let item_count = u64::try_from(layout.item_count).unwrap_or(u64::MAX);
-        let nominal_used_u64 = remaining.min(item_count);
-        let nominal_used =
+        let nominal_used_u64 = if recover_unknown_tail {
+            item_count
+        } else {
+            remaining.min(item_count)
+        };
+        let mut nominal_used =
             usize::try_from(nominal_used_u64).map_err(|_| SdJournalError::LimitExceeded {
                 kind: LimitKind::ObjectSizeBytes,
                 limit: file.inner.config.max_object_size_bytes,
             })?;
         if nominal_used == 0 {
-            if file.disposed_recovery() && layout.physical_tail {
-                terminal = Some(SdJournalError::PermanentDisposed {
-                    path: file.path().to_owned(),
-                    offset: Some(current),
-                    reason: "ENTRY_ARRAY has no complete item at the disposed file boundary".into(),
-                });
-                remaining = 0;
-                break;
+            if frontier_recovery {
+                let contradiction = file.metadata_error(
+                    Some(current),
+                    if layout.physical_tail {
+                        "ENTRY_ARRAY has no complete item at the disposed file boundary"
+                    } else {
+                        "ENTRY_ARRAY exists beyond the header-declared entry count"
+                    },
+                );
+                if layout.item_count != 0 && read_entry_array_item(file, current, &layout, 0)? != 0
+                {
+                    terminal = Some(contradiction);
+                    recover_unknown_tail = true;
+                    nominal_used = layout.item_count;
+                } else {
+                    terminal = Some(contradiction);
+                    remaining = 0;
+                    break;
+                }
+            } else {
+                if file.inner.header.state == STATE_ONLINE && allow_online_snapshot_truncate {
+                    break;
+                }
+                return Err(file.metadata_error(
+                    Some(current),
+                    "ENTRY_ARRAY chain contains more objects than entry metadata requires",
+                ));
             }
-            if file.inner.header.state == STATE_ONLINE && allow_online_snapshot_truncate {
-                break;
-            }
-            return Err(file.metadata_error(
-                Some(current),
-                "ENTRY_ARRAY chain contains more objects than entry metadata requires",
-            ));
         }
-        let (used_items, first, last, reached_snapshot_tail, prefix_terminal) =
+        let (used_items, first, last, reached_snapshot_tail, prefix_terminal) = if frontier_recovery
+        {
+            (nominal_used, 0, 0, false, None)
+        } else {
             validate_entry_array_prefix(
                 file,
                 current,
@@ -700,7 +819,8 @@ fn collect_entry_array_descriptors(
                 nominal_used,
                 previous_last,
                 allow_online_snapshot_truncate,
-            )?;
+            )?
+        };
         terminal = terminal.or(prefix_terminal);
         if used_items != 0 {
             previous_last = Some(last);
@@ -710,12 +830,13 @@ fn collect_entry_array_descriptors(
                 used_items,
                 first,
                 last,
-                prefix_items: expected_items - remaining,
+                prefix_items: indexed_items,
             });
+            indexed_items = indexed_items.saturating_add(used_items as u64);
             remaining = remaining.saturating_sub(u64::try_from(used_items).unwrap_or(u64::MAX));
         }
         if reached_snapshot_tail || layout.physical_tail {
-            if terminal.is_none() && layout.physical_tail {
+            if terminal.is_none() && layout.physical_tail && remaining != 0 {
                 terminal = Some(SdJournalError::PermanentDisposed {
                     path: file.path().to_owned(),
                     offset: Some(current),
@@ -728,18 +849,54 @@ fn collect_entry_array_descriptors(
 
         let next = layout.next_entry_array_offset;
         if next != 0 && next <= current {
-            return Err(file.metadata_error(
+            let error = file.metadata_error(
                 Some(current),
                 format!("ENTRY_ARRAY next offset does not move forward ({next} <= {current})"),
-            ));
+            );
+            if frontier_recovery {
+                terminal = Some(error);
+                remaining = 0;
+                break;
+            }
+            return Err(error);
         }
-        let first_unused =
-            if file.inner.header.state != STATE_ONLINE && used_items < layout.item_count {
-                Some(read_entry_array_item(file, current, &layout, used_items)?)
-            } else {
-                None
-            };
-        if remaining == 0
+        let first_unused = if (frontier_recovery || file.inner.header.state != STATE_ONLINE)
+            && used_items < layout.item_count
+        {
+            match read_entry_array_item(file, current, &layout, used_items) {
+                Ok(offset) => Some(offset),
+                Err(error) if frontier_recovery => {
+                    terminal = Some(file.classify_disposed_error(Some(current), error));
+                    remaining = 0;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        if frontier_recovery
+            && !recover_unknown_tail
+            && remaining == 0
+            && (first_unused.is_some_and(|offset| offset != 0) || next != 0)
+        {
+            terminal.get_or_insert_with(|| {
+                file.metadata_error(
+                    Some(current),
+                    "ENTRY_ARRAY data extends beyond the header-declared entry count",
+                )
+            });
+            recover_unknown_tail = true;
+            if first_unused.is_some_and(|offset| offset != 0)
+                && let Some(array) = arrays.last_mut()
+            {
+                let additional = layout.item_count.saturating_sub(array.used_items);
+                array.used_items = layout.item_count;
+                indexed_items = indexed_items.saturating_add(additional as u64);
+            }
+        }
+        if !frontier_recovery
+            && remaining == 0
             && !allow_online_snapshot_truncate
             && start == file.inner.header.entry_array_offset
             && expected_items == file.inner.header.n_entries
@@ -751,26 +908,53 @@ fn collect_entry_array_descriptors(
         {
             break;
         }
-        if file.inner.header.state != STATE_ONLINE && used_items < layout.item_count {
+        if !frontier_recovery
+            && file.inner.header.state != STATE_ONLINE
+            && used_items < layout.item_count
+        {
             if first_unused != Some(0) {
-                return Err(file.metadata_error(
+                let error = file.metadata_error(
                     Some(current),
                     "ENTRY_ARRAY unused tail starts with a non-zero offset",
-                ));
+                );
+                if frontier_recovery {
+                    terminal = Some(error);
+                    remaining = 0;
+                    break;
+                }
+                return Err(error);
             }
             if next != 0 {
-                return Err(file.metadata_error(
+                let error = file.metadata_error(
                     Some(current),
                     "partially used ENTRY_ARRAY unexpectedly links to another object",
-                ));
+                );
+                if frontier_recovery {
+                    terminal = Some(error);
+                    remaining = 0;
+                    break;
+                }
+                return Err(error);
             }
         }
         if remaining == 0 {
+            if frontier_recovery && recover_unknown_tail {
+                if next == 0 {
+                    break;
+                }
+                current = next;
+                continue;
+            }
             if file.inner.header.state != STATE_ONLINE && next != 0 {
-                return Err(file.metadata_error(
+                let error = file.metadata_error(
                     Some(current),
                     "ENTRY_ARRAY chain contains more objects than entry metadata requires",
-                ));
+                );
+                if frontier_recovery {
+                    terminal = Some(error);
+                    break;
+                }
+                return Err(error);
             }
             break;
         }
@@ -778,18 +962,28 @@ fn collect_entry_array_descriptors(
     }
 
     if remaining != 0 {
-        return Err(file.metadata_error(
+        let error = file.metadata_error(
             Some(start),
             format!(
                 "ENTRY_ARRAY chain contains fewer offsets than entry metadata requires ({remaining} missing)"
             ),
-        ));
+        );
+        if frontier_recovery {
+            terminal = Some(error);
+        } else {
+            return Err(error);
+        }
     }
     if expected_items == 0 && !arrays.is_empty() {
-        return Err(file.metadata_error(
+        let error = file.metadata_error(
             Some(start),
             "ENTRY_ARRAY chain is present for zero expected entries",
-        ));
+        );
+        if frontier_recovery {
+            terminal = Some(error);
+        } else {
+            return Err(error);
+        }
     }
 
     Ok(EntryArrayPlan { arrays, terminal })
@@ -811,11 +1005,7 @@ fn validate_entry_array_prefix(
         last: 0,
         prefix_items: 0,
     };
-    let items_per_chunk = if file.disposed_recovery() {
-        1
-    } else {
-        (ENTRY_ARRAY_CHUNK_BYTES / layout.item_size).max(1)
-    };
+    let items_per_chunk = (ENTRY_ARRAY_CHUNK_BYTES / layout.item_size).max(1);
     let mut validated = 0usize;
     let mut first = None;
     let mut last = previous_last;
@@ -1236,7 +1426,8 @@ fn read_entry_array_item_range(
                 "ENTRY_ARRAY contains a zero offset before its unused tail",
             ));
         }
-        if let Some(previous) = items.last()
+        if !file.disposed_recovery()
+            && let Some(previous) = items.last()
             && *previous != 0
             && value != 0
             && value <= *previous

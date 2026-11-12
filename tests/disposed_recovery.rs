@@ -12,7 +12,7 @@ mod fixture {
         "/tests/support/synthetic_journal.rs"
     ));
 }
-use fixture::{SyntheticJournalFile, synthetic_message};
+use fixture::{SyntheticJournalFile, synthetic_message, synthetic_realtime_usec};
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
@@ -56,6 +56,8 @@ struct Summary {
     positions: Vec<FilePosition>,
     terminated: Vec<(u64, String)>,
     permanent_omissions: usize,
+    positioned_omissions: usize,
+    positionless_omissions: usize,
     stopped: Vec<String>,
 }
 
@@ -74,11 +76,18 @@ fn scan(journal: &Journal, positions: &[FilePosition]) -> Summary {
                     .push(String::from_utf8(entry.get("MESSAGE").unwrap().to_vec()).unwrap());
                 summary.positions.push(position);
             }
-            ScanItem::Omitted { error, .. } => {
+            ScanItem::Omitted {
+                position, error, ..
+            } => {
                 summary.permanent_omissions += usize::from(matches!(
                     error,
                     sdjournal::SdJournalError::PermanentDisposed { .. }
                 ));
+                if position.is_some() {
+                    summary.positioned_omissions += 1;
+                } else {
+                    summary.positionless_omissions += 1;
+                }
             }
             ScanItem::FileTerminated {
                 last_ordinal,
@@ -209,6 +218,34 @@ fn disposed_non_tail_entry_corruption_is_reported_while_later_slots_continue() {
         ]
     );
     assert_eq!(summary.permanent_omissions, 1);
+    assert_eq!(summary.positionless_omissions, 1);
+}
+
+#[test]
+fn disposed_corrupt_data_keeps_its_real_position_and_later_entries() {
+    let fixture = SyntheticJournalFile::new(&["one.service", "two.service", "three.service"]);
+    let source = fixture.root().join("synthetic.journal");
+    let target = fixture.root().join("corrupt-data.journal~");
+    fs::rename(source, &target).unwrap();
+    let mut bytes = fs::read(&target).unwrap();
+    let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
+    let second_entry = usize::try_from(read_u64(&bytes, array + 24 + 8)).unwrap();
+    let second_data = usize::try_from(read_u64(&bytes, second_entry + 64)).unwrap();
+    bytes[second_data] = 0xff;
+    fs::write(&target, bytes).unwrap();
+    let journal =
+        Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[]).unwrap();
+    let summary = scan(&journal, &[]);
+    assert_eq!(
+        summary.messages,
+        [
+            synthetic_message(7, 0, "one.service"),
+            synthetic_message(7, 2, "three.service")
+        ]
+    );
+    assert_eq!(summary.permanent_omissions, 1);
+    assert_eq!(summary.positioned_omissions, 1);
+    assert!(summary.terminated.is_empty());
 }
 
 #[test]
@@ -363,6 +400,114 @@ fn header_claimed_zero_frontier_is_visible_permanent_loss_after_prefix() {
     assert_eq!(summary.messages.len(), 3);
     assert_eq!(summary.terminated.len(), 1);
     assert_eq!(summary.terminated[0].0, 3);
+}
+
+#[test]
+fn disposed_header_older_than_body_yields_known_slots_then_reports_the_contradiction() {
+    for state in [0, 1, 2] {
+        let fixture = SyntheticJournalFile::new(&["one.service", "two.service", "three.service"]);
+        let source = fixture.root().join("synthetic.journal");
+        let target = fixture.root().join(format!("old-header-{state}.journal~"));
+        fs::rename(source, &target).unwrap();
+        let mut bytes = fs::read(&target).unwrap();
+        bytes[16] = state;
+        write_u64(&mut bytes, 152, 2);
+        fs::write(&target, bytes).unwrap();
+        let journal =
+            Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[])
+                .unwrap();
+        let summary = scan(&journal, &[]);
+        assert_eq!(summary.messages.len(), 3, "state={state}");
+        assert_eq!(summary.terminated.len(), 1, "state={state}");
+        assert_eq!(summary.terminated[0].0, 3, "state={state}");
+    }
+}
+
+#[test]
+fn disposed_terminal_is_pending_and_resume_reports_the_last_trusted_ordinal() {
+    let (fixture, _) = torn_fixture("journal~");
+    let journal =
+        Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[]).unwrap();
+    let mut scan = journal
+        .scan_from_positions(&[], ScanOptions::default())
+        .unwrap();
+    let first = scan.next().unwrap().unwrap();
+    let second = scan.next().unwrap().unwrap();
+    let ScanItem::Entry { position, .. } = second else {
+        panic!("second validated prefix entry")
+    };
+    assert!(matches!(first, ScanItem::Entry { .. }));
+    assert!(
+        scan.has_pending_entries(),
+        "the terminal loss notice is still pending"
+    );
+    assert!(matches!(
+        scan.next().unwrap().unwrap(),
+        ScanItem::FileTerminated {
+            last_ordinal: 2,
+            ..
+        }
+    ));
+
+    let mut resumed = journal
+        .scan_from_positions(&[position], ScanOptions::default())
+        .unwrap();
+    assert!(matches!(
+        resumed.next().unwrap().unwrap(),
+        ScanItem::FileTerminated {
+            last_ordinal: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn checkpoint_beyond_surviving_prefix_replays_without_skipping_positions() {
+    let fixture = SyntheticJournalFile::new(&["one.service", "two.service", "three.service"]);
+    let source = fixture.root().join("synthetic.journal");
+    let target = fixture.root().join("rewound.journal~");
+    fs::rename(source, &target).unwrap();
+    let intact =
+        Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[]).unwrap();
+    let original = scan(&intact, &[]);
+    let acknowledged = original.positions[2];
+    drop(intact);
+
+    let mut bytes = fs::read(&target).unwrap();
+    let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
+    let second = read_u64(&bytes, array + 24 + 8);
+    write_u64(&mut bytes, array + 24 + 16, 0);
+    write_u64(&mut bytes, 152, 2);
+    write_u64(&mut bytes, 136, second);
+    write_u64(&mut bytes, 160, 2);
+    write_u64(&mut bytes, 192, synthetic_realtime_usec(7, 1));
+    write_u64(&mut bytes, 264, second);
+    fs::write(&target, bytes).unwrap();
+
+    let rewound =
+        Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[]).unwrap();
+    let items = rewound
+        .scan_from_positions(&[acknowledged], ScanOptions::default())
+        .unwrap()
+        .collect::<sdjournal::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, ScanItem::Replayed { .. }))
+    );
+    let positions = items
+        .iter()
+        .filter_map(|item| match item {
+            ScanItem::Entry { position, .. } => Some(position.ordinal),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        positions,
+        [1, 2],
+        "safe replay may duplicate but cannot skip the surviving prefix"
+    );
 }
 
 #[test]

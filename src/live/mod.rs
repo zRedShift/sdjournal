@@ -1331,6 +1331,7 @@ fn is_skippable_live_file_error(err: &SdJournalError) -> bool {
         err,
         SdJournalError::Retired { .. }
             | SdJournalError::Corrupt { .. }
+            | SdJournalError::PermanentDisposed { .. }
             | SdJournalError::Transient { .. }
             | SdJournalError::Io { .. }
             | SdJournalError::LimitExceeded {
@@ -1441,6 +1442,17 @@ fn merge_entry_sources(mut sources: Vec<VecDeque<EntryRef>>, reverse: bool) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanent_disposed_file_loss_is_skippable_by_live_catalogs() {
+        assert!(is_skippable_live_file_error(
+            &SdJournalError::PermanentDisposed {
+                path: std::path::PathBuf::from("previous.journal~"),
+                offset: Some(272),
+                reason: "disposed tail".into(),
+            }
+        ));
+    }
 
     #[test]
     fn compare_keys_keeps_sequence_order_across_realtime_rollback() {

@@ -578,6 +578,9 @@ impl Journal {
             }
             match FileEntryIter::positioned(file.clone(), position) {
                 Ok((iter, matched)) => {
+                    if let Some(ordinal) = matched {
+                        scan.owners[owner_index].last_ordinal = ordinal;
+                    }
                     if position.is_some() && matched.is_none() {
                         scan.notices.push_back(ScanItem::Replayed {
                             file: identity.clone(),
@@ -679,6 +682,19 @@ impl PositionedScan {
                 .map_err(|error| file.file.classify_disposed_error(Some(offset), error))
             {
                 Ok(meta) => {
+                    if let Err(error) = file.iter.accept_valid_offset(meta.entry_offset) {
+                        if file.iter.has_remaining_slots() && omittable(&error) {
+                            self.notices.push_back(ScanItem::Omitted {
+                                file: file.identity.clone(),
+                                entry_offset: offset,
+                                ordinal,
+                                position: None,
+                                error,
+                            });
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     self.owners[file.owner_index].last_ordinal = ordinal;
                     file.next = Some((meta, ordinal));
                     Ok(())

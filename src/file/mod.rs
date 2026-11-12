@@ -72,13 +72,13 @@ fn classify_disposed_error(
         return error;
     }
     match error {
-        SdJournalError::Corrupt { reason, .. }
-        | SdJournalError::Transient { reason, .. }
-        | SdJournalError::Unsupported { reason } => SdJournalError::PermanentDisposed {
-            path: path.to_owned(),
-            offset,
-            reason,
-        },
+        SdJournalError::Corrupt { reason, .. } | SdJournalError::Unsupported { reason } => {
+            SdJournalError::PermanentDisposed {
+                path: path.to_owned(),
+                offset,
+                reason,
+            }
+        }
         SdJournalError::DecompressFailed { algo, reason } => SdJournalError::PermanentDisposed {
             path: path.to_owned(),
             offset,
@@ -321,7 +321,8 @@ impl JournalFile {
             header.header_size,
             header.arena_size,
             "header_size+arena_size",
-        )?;
+        )
+        .map_err(|error| classify_disposed_error(disposed_recovery, &path, Some(96), error))?;
 
         #[cfg(feature = "tracing")]
         debug!(

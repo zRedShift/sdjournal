@@ -520,7 +520,11 @@ impl FileBranchIter {
                     });
                 }
                 Ok(refs) => data_refs.push(refs),
-                Err(SdJournalError::Corrupt { .. } | SdJournalError::Transient { .. }) => {
+                Err(
+                    SdJournalError::Corrupt { .. }
+                    | SdJournalError::PermanentDisposed { .. }
+                    | SdJournalError::Transient { .. },
+                ) => {
                     let iter = scan_iter(file.clone(), reverse, after_entry_offset)?;
                     return Ok(Self {
                         file,
@@ -549,7 +553,11 @@ impl FileBranchIter {
                 };
                 match result {
                     Ok(iter) => term_iters.push(iter),
-                    Err(SdJournalError::Corrupt { .. } | SdJournalError::Transient { .. }) => {
+                    Err(
+                        SdJournalError::Corrupt { .. }
+                        | SdJournalError::PermanentDisposed { .. }
+                        | SdJournalError::Transient { .. },
+                    ) => {
                         let iter = scan_iter(file.clone(), reverse, after_entry_offset)?;
                         return Ok(Self {
                             file,
