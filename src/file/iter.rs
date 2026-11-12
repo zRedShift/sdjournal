@@ -478,7 +478,8 @@ impl FileEntryIter {
                         if position.matches(&meta)
                             && (position.ordinal == 0 || position.ordinal == ordinal) =>
                     {
-                        if ordinal == file.inner.header.n_entries
+                        if !file.disposed_recovery()
+                            && ordinal == file.inner.header.n_entries
                             && (file
                                 .inner
                                 .header
