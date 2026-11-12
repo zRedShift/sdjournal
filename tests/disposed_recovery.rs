@@ -59,6 +59,7 @@ struct Summary {
     positioned_omissions: usize,
     positionless_omissions: usize,
     stopped: Vec<String>,
+    replayed: usize,
 }
 
 fn scan(journal: &Journal, positions: &[FilePosition]) -> Summary {
@@ -95,7 +96,7 @@ fn scan(journal: &Journal, positions: &[FilePosition]) -> Summary {
                 ..
             } => summary.terminated.push((last_ordinal, error.to_string())),
             ScanItem::FileStopped { error, .. } => summary.stopped.push(error.to_string()),
-            ScanItem::Replayed { .. } => {}
+            ScanItem::Replayed { .. } => summary.replayed += 1,
         }
     }
     summary
@@ -420,6 +421,19 @@ fn disposed_header_older_than_body_yields_known_slots_then_reports_the_contradic
         assert_eq!(summary.messages.len(), 3, "state={state}");
         assert_eq!(summary.terminated.len(), 1, "state={state}");
         assert_eq!(summary.terminated[0].0, 3, "state={state}");
+
+        let resumed = scan(&journal, &summary.positions[1..2]);
+        assert_eq!(
+            resumed.messages,
+            [synthetic_message(7, 2, "three.service")],
+            "state={state}"
+        );
+        assert_eq!(resumed.terminated.len(), 1, "state={state}");
+        assert_eq!(resumed.terminated[0].0, 3, "state={state}");
+        assert_eq!(
+            resumed.replayed, 0,
+            "the exact validated anchor remains authoritative"
+        );
     }
 }
 
