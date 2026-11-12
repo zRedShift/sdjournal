@@ -714,18 +714,19 @@ impl JournalFile {
             ));
         }
         if offset < self.inner.header.header_size || outside_snapshot {
-            return Err(self.metadata_error(
-                Some(offset),
+            let reason = if self.inner.disposed_recovery {
                 format!(
                     "object offset is outside the journal snapshot (header_size={}, upper_bound={})",
                     self.inner.header.header_size,
-                    if self.inner.disposed_recovery {
-                        self.inner.used_size.saturating_sub(1)
-                    } else {
-                        self.inner.header.tail_object_offset
-                    }
-                ),
-            ));
+                    self.inner.used_size.saturating_sub(1)
+                )
+            } else {
+                format!(
+                    "object offset is outside committed journal data (header_size={}, tail_object_offset={})",
+                    self.inner.header.header_size, self.inner.header.tail_object_offset
+                )
+            };
+            return Err(self.metadata_error(Some(offset), reason));
         }
         Ok(())
     }

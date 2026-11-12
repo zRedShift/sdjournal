@@ -572,6 +572,10 @@ fn every_disposed_head_position_resumes_the_exact_remaining_suffix() {
                     "state={state} declared={declared} tail={tail_follows_declared_count}"
                 );
                 assert_eq!(head.positions.len(), 4);
+                assert_eq!(
+                    head.positionless_omissions, 0,
+                    "state={state} declared={declared} tail={tail_follows_declared_count}"
+                );
                 for (index, position) in head.positions.iter().copied().enumerate() {
                     let resumed = scan(&journal, &[position]);
                     assert_eq!(
