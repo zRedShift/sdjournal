@@ -567,7 +567,8 @@ impl Journal {
             let position = marks.get(&info.file_id).copied();
             if let Some(position) = position {
                 match file.position_is_stable_tail(position) {
-                    Ok(true) => continue,
+                    Ok(true) if !file.disposed_recovery() => continue,
+                    Ok(true) => {}
                     Ok(false) => {}
                     Err(error @ SdJournalError::Retired { .. }) => return Err(error),
                     Err(error) => {
