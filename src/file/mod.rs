@@ -701,21 +701,29 @@ impl JournalFile {
     }
 
     pub(crate) fn validate_object_offset(&self, offset: u64) -> Result<()> {
+        let outside_snapshot = if self.inner.disposed_recovery {
+            offset >= self.inner.used_size
+        } else {
+            self.inner.header.tail_object_offset == 0
+                || offset > self.inner.header.tail_object_offset
+        };
         if !offset.is_multiple_of(8) {
             return Err(self.metadata_error(
                 Some(offset),
                 format!("object offset is not 8-byte aligned: {offset}"),
             ));
         }
-        if offset < self.inner.header.header_size
-            || self.inner.header.tail_object_offset == 0
-            || offset > self.inner.header.tail_object_offset
-        {
+        if offset < self.inner.header.header_size || outside_snapshot {
             return Err(self.metadata_error(
                 Some(offset),
                 format!(
-                    "object offset is outside committed journal data (header_size={}, tail_object_offset={})",
-                    self.inner.header.header_size, self.inner.header.tail_object_offset
+                    "object offset is outside the journal snapshot (header_size={}, upper_bound={})",
+                    self.inner.header.header_size,
+                    if self.inner.disposed_recovery {
+                        self.inner.used_size.saturating_sub(1)
+                    } else {
+                        self.inner.header.tail_object_offset
+                    }
                 ),
             ));
         }
