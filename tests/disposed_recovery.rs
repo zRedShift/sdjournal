@@ -525,6 +525,76 @@ fn checkpoint_beyond_surviving_prefix_replays_without_skipping_positions() {
 }
 
 #[test]
+fn every_disposed_head_position_resumes_the_exact_remaining_suffix() {
+    for state in [0, 1, 2] {
+        for declared in 0usize..=4 {
+            for tail_follows_declared_count in [false, true] {
+                let fixture = SyntheticJournalFile::new(&[
+                    "one.service",
+                    "two.service",
+                    "three.service",
+                    "four.service",
+                ]);
+                let source = fixture.root().join("synthetic.journal");
+                let target = fixture.root().join(format!(
+                    "matrix-{state}-{declared}-{tail_follows_declared_count}.journal~"
+                ));
+                fs::rename(source, &target).unwrap();
+                let mut bytes = fs::read(&target).unwrap();
+                bytes[16] = state;
+                write_u64(&mut bytes, 152, declared as u64);
+                if tail_follows_declared_count {
+                    let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
+                    let tail =
+                        (declared != 0).then(|| read_u64(&bytes, array + 24 + (declared - 1) * 8));
+                    write_u64(&mut bytes, 160, declared as u64);
+                    write_u64(
+                        &mut bytes,
+                        192,
+                        tail.map_or(0, |_| {
+                            synthetic_realtime_usec(7, declared.saturating_sub(1))
+                        }),
+                    );
+                    write_u64(&mut bytes, 264, tail.unwrap_or(0));
+                }
+                fs::write(&target, bytes).unwrap();
+                let journal = Journal::open_progress_dirs(
+                    &[fixture.root().to_owned()],
+                    recovery_config(),
+                    &[],
+                )
+                .unwrap();
+                let head = scan(&journal, &[]);
+                assert_eq!(
+                    head.messages.len(),
+                    4,
+                    "state={state} declared={declared} tail={tail_follows_declared_count}"
+                );
+                assert_eq!(head.positions.len(), 4);
+                for (index, position) in head.positions.iter().copied().enumerate() {
+                    let resumed = scan(&journal, &[position]);
+                    assert_eq!(
+                        resumed.messages,
+                        head.messages[index + 1..],
+                        "state={state} declared={declared} tail={tail_follows_declared_count} position={}",
+                        index + 1
+                    );
+                    assert_eq!(
+                        resumed.positions,
+                        head.positions[index + 1..],
+                        "state={state} declared={declared} tail={tail_follows_declared_count} position={}",
+                        index + 1
+                    );
+                    assert_eq!(resumed.replayed, 0);
+                    assert!(resumed.stopped.is_empty());
+                    assert_eq!(resumed.terminated, head.terminated);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn short_disposed_header_is_explicit_permanent_open_loss_with_physical_identity() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("short.journal~");
