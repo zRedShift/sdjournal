@@ -547,6 +547,7 @@ fn every_disposed_head_position_resumes_the_exact_remaining_suffix() {
                     let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
                     let tail =
                         (declared != 0).then(|| read_u64(&bytes, array + 24 + (declared - 1) * 8));
+                    write_u64(&mut bytes, 136, tail.unwrap_or(0));
                     write_u64(&mut bytes, 160, declared as u64);
                     write_u64(
                         &mut bytes,
