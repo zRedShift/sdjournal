@@ -205,6 +205,15 @@ pub enum ScanItem {
         /// Original failure.
         error: SdJournalError,
     },
+    /// Immutable disposed bytes ended with permanent structural or truncation loss.
+    FileTerminated {
+        /// Affected immutable owner.
+        file: FileIdentity,
+        /// Last ordinal whose complete ENTRY metadata was validated; diagnostic only.
+        last_ordinal: u64,
+        /// Permanent loss detail. This never authorizes checkpoint progress.
+        error: SdJournalError,
+    },
     /// An invalid/missing checkpoint anchor replayed this file from its head.
     Replayed {
         /// Replayed file.
@@ -321,6 +330,7 @@ impl PayloadCache {
 struct ScanOwner {
     file: JournalFile,
     reported_failure: bool,
+    last_ordinal: u64,
 }
 
 struct FileScan {
@@ -350,6 +360,7 @@ fn omittable(error: &SdJournalError) -> bool {
     matches!(
         error,
         SdJournalError::Corrupt { .. }
+            | SdJournalError::PermanentDisposed { .. }
             | SdJournalError::DecompressFailed { .. }
             | SdJournalError::LimitExceeded { .. }
             | SdJournalError::Unsupported { .. }
@@ -551,6 +562,7 @@ impl Journal {
             scan.owners.push(ScanOwner {
                 file: file.clone(),
                 reported_failure: false,
+                last_ordinal: 0,
             });
             let position = marks.get(&info.file_id).copied();
             if let Some(position) = position {
@@ -593,15 +605,25 @@ impl PositionedScan {
     // Keep retirement global, but a linked per-file failure must never poison
     // a healthy peer. A failed owner is still rechecked for actual retirement.
     fn report_owner_error(&mut self, index: usize, error: SdJournalError) -> Result<()> {
+        let error = self.owners[index].file.classify_disposed_error(None, error);
         if matches!(error, SdJournalError::Retired { .. }) {
             return Err(error);
         }
         let owner = &mut self.owners[index];
         if !owner.reported_failure {
-            self.notices.push_back(ScanItem::FileStopped {
-                file: FileIdentity::from_file(&owner.file),
-                error,
-            });
+            let item = if matches!(error, SdJournalError::PermanentDisposed { .. }) {
+                ScanItem::FileTerminated {
+                    file: FileIdentity::from_file(&owner.file),
+                    last_ordinal: owner.last_ordinal,
+                    error,
+                }
+            } else {
+                ScanItem::FileStopped {
+                    file: FileIdentity::from_file(&owner.file),
+                    error,
+                }
+            };
+            self.notices.push_back(item);
             owner.reported_failure = true;
         }
         for file in &mut self.files {
@@ -651,12 +673,22 @@ impl PositionedScan {
                 Ok(())
             }
             Some(Err(error)) => Err(error),
-            Some(Ok((offset, ordinal))) => match file.file.read_entry_meta(offset) {
+            Some(Ok((offset, ordinal))) => match file
+                .file
+                .read_entry_meta(offset)
+                .map_err(|error| file.file.classify_disposed_error(Some(offset), error))
+            {
                 Ok(meta) => {
+                    self.owners[file.owner_index].last_ordinal = ordinal;
                     file.next = Some((meta, ordinal));
                     Ok(())
                 }
                 Err(error @ SdJournalError::Retired { .. }) => Err(error),
+                Err(error @ SdJournalError::PermanentDisposed { .. })
+                    if !file.iter.has_remaining_slots() =>
+                {
+                    Err(error)
+                }
                 Err(error) if omittable(&error) => {
                     self.notices.push_back(ScanItem::Omitted {
                         file: file.identity.clone(),
@@ -733,9 +765,15 @@ impl Iterator for PositionedScan {
         };
         self.prime_round = true;
         let position = FilePosition::from_meta(meta, ordinal);
+        self.owners[self.files[index].owner_index].last_ordinal = ordinal;
         let result = self.files[index]
             .file
-            .read_entry_ref_with_cache(meta.entry_offset, self.cache.as_mut());
+            .read_entry_ref_with_cache(meta.entry_offset, self.cache.as_mut())
+            .map_err(|error| {
+                self.files[index]
+                    .file
+                    .classify_disposed_error(Some(meta.entry_offset), error)
+            });
         match result {
             Ok(entry) => {
                 let mut aliases = Vec::new();
@@ -760,6 +798,7 @@ impl Iterator for PositionedScan {
                             continue;
                         }
                         aliases.push(FilePosition::from_meta(other, ordinal));
+                        self.owners[self.files[other_index].owner_index].last_ordinal = ordinal;
                         self.files[other_index].next = None;
                     }
                 }
@@ -924,6 +963,43 @@ mod tests {
             assert!(legacy > direct);
             println!("tail entries={n}: positioned={direct} old-query={legacy}");
         }
+    }
+
+    #[test]
+    fn disposed_recovery_keeps_actual_read_io_retryable() {
+        let fixture = fixture::SyntheticJournalFile::new(&["one.service"]);
+        let source = fixture.root().join("synthetic.journal");
+        let disposed = fixture.root().join("previous.journal~");
+        std::fs::rename(source, &disposed).unwrap();
+        let journal = Journal::open_progress_dirs(
+            &[fixture.root().to_owned()],
+            JournalConfig {
+                recover_disposed_journal_tails: true,
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        test_io::reset();
+        test_io::read_steps([Err(std::io::ErrorKind::Other)]);
+        let items = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(items.iter().any(|item| matches!(
+            item,
+            ScanItem::FileStopped {
+                error: SdJournalError::Io { .. },
+                ..
+            }
+        )));
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, ScanItem::FileTerminated { .. }))
+        );
     }
 }
 

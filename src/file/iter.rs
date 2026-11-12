@@ -254,13 +254,17 @@ impl DataEntryOffsetIter {
         after_entry_offset: Option<u64>,
     ) -> Result<Self> {
         validate_data_entry_metadata(&file, data)?;
-        let descriptors = collect_entry_array_descriptors(
+        let plan = collect_entry_array_descriptors(
             &file,
             data.entry_array_offset,
             data.n_entries
                 .saturating_sub(u64::from(data.entry_offset != 0)),
             true,
         )?;
+        if let Some(error) = plan.terminal {
+            return Err(error);
+        }
+        let descriptors = plan.arrays;
         if let Some(first_array) = descriptors.first()
             && first_array.first <= data.entry_offset
         {
@@ -370,12 +374,13 @@ pub(crate) struct EntryRange {
 pub(crate) struct FileEntryIter {
     file: JournalFile,
     arrays: EntryArrayCursor,
+    terminal: Option<SdJournalError>,
     exhausted: bool,
 }
 
 impl FileEntryIter {
     pub(crate) fn has_remaining_slots(&self) -> bool {
-        if self.exhausted || self.arrays.exhausted {
+        if self.exhausted || self.arrays.exhausted && self.terminal.is_none() {
             return false;
         }
         if !self.arrays.current_items.is_empty() {
@@ -396,12 +401,13 @@ impl FileEntryIter {
         position: Option<&crate::FilePosition>,
     ) -> Result<(Self, Option<u64>)> {
         file.validate_snapshot()?;
-        let descriptors = collect_entry_array_descriptors(
+        let plan = collect_entry_array_descriptors(
             &file,
             file.inner.header.entry_array_offset,
             file.inner.header.n_entries,
             false,
         )?;
+        let descriptors = plan.arrays;
         let mut matched = None;
         let mut matched_split = None;
         if let Some(position) = position {
@@ -476,6 +482,7 @@ impl FileEntryIter {
             Self {
                 file,
                 arrays,
+                terminal: plan.terminal,
                 exhausted: false,
             },
             matched,
@@ -493,8 +500,12 @@ impl FileEntryIter {
                 Some(Err(error))
             }
             None => {
-                self.exhausted = true;
-                None
+                if let Some(error) = self.terminal.take() {
+                    Some(Err(error))
+                } else {
+                    self.exhausted = true;
+                    None
+                }
             }
         }
     }
@@ -505,16 +516,17 @@ impl FileEntryIter {
         _since_realtime: Option<u64>,
         _until_realtime: Option<u64>,
     ) -> Result<Self> {
-        let descriptors = collect_entry_array_descriptors(
+        let plan = collect_entry_array_descriptors(
             &file,
             file.inner.header.entry_array_offset,
             file.inner.header.n_entries,
             false,
         )?;
-        let arrays = EntryArrayCursor::new(file.clone(), descriptors, reverse);
+        let arrays = EntryArrayCursor::new(file.clone(), plan.arrays, reverse);
         Ok(Self {
             file,
             arrays,
+            terminal: plan.terminal,
             exhausted: false,
         })
     }
@@ -524,7 +536,7 @@ impl FileEntryIter {
         reverse: bool,
         after_entry_offset: u64,
     ) -> Result<Self> {
-        let descriptors = collect_entry_array_descriptors(
+        let plan = collect_entry_array_descriptors(
             &file,
             file.inner.header.entry_array_offset,
             file.inner.header.n_entries,
@@ -532,7 +544,7 @@ impl FileEntryIter {
         )?;
         let arrays = EntryArrayCursor::new_after_offset(
             file.clone(),
-            descriptors,
+            plan.arrays,
             reverse,
             after_entry_offset,
         )?;
@@ -540,6 +552,7 @@ impl FileEntryIter {
         Ok(Self {
             file,
             arrays,
+            terminal: plan.terminal,
             exhausted: false,
         })
     }
@@ -565,8 +578,12 @@ impl Iterator for FileEntryIter {
         match self.arrays.next() {
             Some(Ok(entry_offset)) => Some(self.file.read_entry_meta(entry_offset)),
             None => {
-                self.exhausted = true;
-                None
+                if let Some(error) = self.terminal.take() {
+                    Some(Err(error))
+                } else {
+                    self.exhausted = true;
+                    None
+                }
             }
             Some(Err(error)) => {
                 self.exhausted = true;
@@ -587,6 +604,12 @@ struct EntryArrayLayout {
     next_entry_array_offset: u64,
     item_size: usize,
     item_count: usize,
+    physical_tail: bool,
+}
+
+struct EntryArrayPlan {
+    arrays: Vec<EntryArrayDescriptor>,
+    terminal: Option<SdJournalError>,
 }
 
 fn validate_data_entry_metadata(file: &JournalFile, data: DataObjectRef) -> Result<()> {
@@ -613,12 +636,13 @@ fn collect_entry_array_descriptors(
     start: u64,
     expected_items: u64,
     allow_online_snapshot_truncate: bool,
-) -> Result<Vec<EntryArrayDescriptor>> {
+) -> Result<EntryArrayPlan> {
     let mut arrays = Vec::new();
     let mut visited = HashSet::new();
     let mut current = start;
     let mut previous_last = None;
     let mut remaining = expected_items;
+    let mut terminal = None;
 
     while current != 0 {
         if !visited.insert(current) {
@@ -634,7 +658,15 @@ fn collect_entry_array_descriptors(
             });
         }
 
-        let layout = read_entry_array_layout(file, current)?;
+        let layout = match read_entry_array_layout(file, current) {
+            Ok(layout) => layout,
+            Err(error @ SdJournalError::PermanentDisposed { .. }) => {
+                terminal = Some(error);
+                remaining = 0;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         let item_count = u64::try_from(layout.item_count).unwrap_or(u64::MAX);
         let nominal_used_u64 = remaining.min(item_count);
         let nominal_used =
@@ -643,6 +675,15 @@ fn collect_entry_array_descriptors(
                 limit: file.inner.config.max_object_size_bytes,
             })?;
         if nominal_used == 0 {
+            if file.disposed_recovery() && layout.physical_tail {
+                terminal = Some(SdJournalError::PermanentDisposed {
+                    path: file.path().to_owned(),
+                    offset: Some(current),
+                    reason: "ENTRY_ARRAY has no complete item at the disposed file boundary".into(),
+                });
+                remaining = 0;
+                break;
+            }
             if file.inner.header.state == STATE_ONLINE && allow_online_snapshot_truncate {
                 break;
             }
@@ -651,14 +692,16 @@ fn collect_entry_array_descriptors(
                 "ENTRY_ARRAY chain contains more objects than entry metadata requires",
             ));
         }
-        let (used_items, first, last, reached_snapshot_tail) = validate_entry_array_prefix(
-            file,
-            current,
-            layout,
-            nominal_used,
-            previous_last,
-            allow_online_snapshot_truncate,
-        )?;
+        let (used_items, first, last, reached_snapshot_tail, prefix_terminal) =
+            validate_entry_array_prefix(
+                file,
+                current,
+                layout,
+                nominal_used,
+                previous_last,
+                allow_online_snapshot_truncate,
+            )?;
+        terminal = terminal.or(prefix_terminal);
         if used_items != 0 {
             previous_last = Some(last);
             arrays.push(EntryArrayDescriptor {
@@ -671,7 +714,14 @@ fn collect_entry_array_descriptors(
             });
             remaining = remaining.saturating_sub(u64::try_from(used_items).unwrap_or(u64::MAX));
         }
-        if reached_snapshot_tail {
+        if reached_snapshot_tail || layout.physical_tail {
+            if terminal.is_none() && layout.physical_tail {
+                terminal = Some(SdJournalError::PermanentDisposed {
+                    path: file.path().to_owned(),
+                    offset: Some(current),
+                    reason: "ENTRY_ARRAY is truncated at the disposed file boundary".into(),
+                });
+            }
             remaining = 0;
             break;
         }
@@ -742,7 +792,7 @@ fn collect_entry_array_descriptors(
         ));
     }
 
-    Ok(arrays)
+    Ok(EntryArrayPlan { arrays, terminal })
 }
 
 fn validate_entry_array_prefix(
@@ -752,7 +802,7 @@ fn validate_entry_array_prefix(
     nominal_used: usize,
     previous_last: Option<u64>,
     allow_online_snapshot_truncate: bool,
-) -> Result<(usize, u64, u64, bool)> {
+) -> Result<(usize, u64, u64, bool, Option<SdJournalError>)> {
     let provisional = EntryArrayDescriptor {
         offset,
         layout,
@@ -761,18 +811,65 @@ fn validate_entry_array_prefix(
         last: 0,
         prefix_items: 0,
     };
-    let items_per_chunk = (ENTRY_ARRAY_CHUNK_BYTES / layout.item_size).max(1);
+    let items_per_chunk = if file.disposed_recovery() {
+        1
+    } else {
+        (ENTRY_ARRAY_CHUNK_BYTES / layout.item_size).max(1)
+    };
     let mut validated = 0usize;
     let mut first = None;
     let mut last = previous_last;
 
     while validated < nominal_used {
         let end = validated.saturating_add(items_per_chunk).min(nominal_used);
-        let items = read_entry_array_item_range(file, &provisional, validated, end)?;
+        let items = match read_entry_array_item_range(file, &provisional, validated, end) {
+            Ok(items) => items,
+            Err(error @ SdJournalError::PermanentDisposed { .. }) => {
+                return Ok((
+                    validated,
+                    first.unwrap_or(0),
+                    last.unwrap_or(0),
+                    true,
+                    Some(error),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         for value in items {
+            if value == 0 && file.disposed_recovery() {
+                return Ok((
+                    validated,
+                    first.unwrap_or(0),
+                    last.unwrap_or(0),
+                    true,
+                    Some(SdJournalError::PermanentDisposed {
+                        path: file.path().to_owned(),
+                        offset: Some(offset),
+                        reason:
+                            "ENTRY_ARRAY reached a zero slot before the header-declared entry count"
+                                .into(),
+                    }),
+                ));
+            }
             if value > file.inner.header.tail_object_offset {
+                if file.disposed_recovery() {
+                    return Ok((
+                        validated,
+                        first.unwrap_or(0),
+                        last.unwrap_or(0),
+                        true,
+                        Some(SdJournalError::PermanentDisposed {
+                            path: file.path().to_owned(),
+                            offset: Some(offset),
+                            reason: format!(
+                                "ENTRY_ARRAY references an object beyond tail_object_offset ({value} > {})",
+                                file.inner.header.tail_object_offset
+                            ),
+                        }),
+                    ));
+                }
                 if file.inner.header.state == STATE_ONLINE && allow_online_snapshot_truncate {
-                    return Ok((validated, first.unwrap_or(0), last.unwrap_or(0), true));
+                    return Ok((validated, first.unwrap_or(0), last.unwrap_or(0), true, None));
                 }
                 return Err(file.metadata_error(
                     Some(offset),
@@ -783,6 +880,21 @@ fn validate_entry_array_prefix(
                 ));
             }
             if value < file.inner.header.header_size || !value.is_multiple_of(8) {
+                if file.disposed_recovery() {
+                    return Ok((
+                        validated,
+                        first.unwrap_or(0),
+                        last.unwrap_or(0),
+                        true,
+                        Some(SdJournalError::PermanentDisposed {
+                            path: file.path().to_owned(),
+                            offset: Some(offset),
+                            reason: format!(
+                                "ENTRY_ARRAY contains an invalid object offset: {value}"
+                            ),
+                        }),
+                    ));
+                }
                 return Err(file.metadata_error(
                     Some(offset),
                     format!("ENTRY_ARRAY contains an invalid object offset: {value}"),
@@ -791,6 +903,21 @@ fn validate_entry_array_prefix(
             if let Some(previous) = last
                 && value <= previous
             {
+                if file.disposed_recovery() {
+                    return Ok((
+                        validated,
+                        first.unwrap_or(0),
+                        last.unwrap_or(0),
+                        true,
+                        Some(SdJournalError::PermanentDisposed {
+                            path: file.path().to_owned(),
+                            offset: Some(offset),
+                            reason: format!(
+                                "ENTRY_ARRAY entry offsets are not strictly increasing ({value} <= {previous})"
+                            ),
+                        }),
+                    ));
+                }
                 return Err(file.metadata_error(
                     Some(offset),
                     format!(
@@ -804,7 +931,13 @@ fn validate_entry_array_prefix(
         }
     }
 
-    Ok((validated, first.unwrap_or(0), last.unwrap_or(0), false))
+    Ok((
+        validated,
+        first.unwrap_or(0),
+        last.unwrap_or(0),
+        false,
+        None,
+    ))
 }
 
 fn locate_entry_array_for_offset(
@@ -963,7 +1096,8 @@ fn read_entry_array_layout(file: &JournalFile, offset: u64) -> Result<EntryArray
     let end = offset
         .checked_add(oh.size)
         .ok_or_else(|| file.metadata_error(Some(offset), "ENTRY_ARRAY object range overflow"))?;
-    if end > file.inner.used_size {
+    let physical_tail = end > file.inner.used_size;
+    if physical_tail && !file.disposed_recovery() {
         return Err(file.metadata_error(
             Some(offset),
             format!(
@@ -980,18 +1114,27 @@ fn read_entry_array_layout(file: &JournalFile, offset: u64) -> Result<EntryArray
             reason: "missing next_entry_array_offset".to_string(),
         })?;
 
-    let item_count = usize::try_from(items_size / item_size as u64).map_err(|_| {
+    let mut item_count = usize::try_from(items_size / item_size as u64).map_err(|_| {
         SdJournalError::LimitExceeded {
             kind: LimitKind::ObjectSizeBytes,
             limit: file.inner.config.max_object_size_bytes,
         }
     })?;
+    if physical_tail {
+        let available = file
+            .inner
+            .used_size
+            .saturating_sub(offset.saturating_add(24))
+            / item_size as u64;
+        item_count = item_count.min(usize::try_from(available).unwrap_or(usize::MAX));
+    }
 
     Ok(EntryArrayLayout {
         size: oh.size,
         next_entry_array_offset,
         item_size,
         item_count,
+        physical_tail,
     })
 }
 
@@ -1087,13 +1230,15 @@ fn read_entry_array_item_range(
                 "ENTRY_ARRAY item truncated",
             )
         })?;
-        if value == 0 {
+        if value == 0 && !file.disposed_recovery() {
             return Err(file.metadata_error(
                 Some(chunk_offset.saturating_add(byte_index as u64)),
                 "ENTRY_ARRAY contains a zero offset before its unused tail",
             ));
         }
         if let Some(previous) = items.last()
+            && *previous != 0
+            && value != 0
             && value <= *previous
         {
             return Err(file.metadata_error(

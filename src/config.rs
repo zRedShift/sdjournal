@@ -118,6 +118,12 @@ pub struct JournalConfig {
     /// journal files.
     pub include_journal_tilde: bool,
 
+    /// Recover immutable `*.journal~` files after journald disposes them.
+    ///
+    /// This implies discovery of those files, but unlike [`Self::include_journal_tilde`]
+    /// classifies permanent structural/truncation failures as non-retryable loss.
+    pub recover_disposed_journal_tails: bool,
+
     /// Polling interval used as fallback when inotify is unavailable or unreliable.
     ///
     /// This affects [`crate::LiveJournal`] latency only on fallback polling paths.
@@ -162,6 +168,7 @@ impl Default for JournalConfig {
             max_query_terms: 64,
             allow_mmap_online: false,
             include_journal_tilde: false,
+            recover_disposed_journal_tails: false,
             poll_interval: Duration::from_millis(2000),
             live_channel_capacity: 64,
             max_live_batch_entries: 64,
@@ -190,6 +197,7 @@ mod tests {
         assert_eq!(cfg.max_query_terms, 64);
         assert!(!cfg.allow_mmap_online);
         assert!(!cfg.include_journal_tilde);
+        assert!(!cfg.recover_disposed_journal_tails);
         assert_eq!(cfg.poll_interval, Duration::from_millis(2000));
         assert_eq!(cfg.live_channel_capacity, 64);
         assert_eq!(cfg.max_live_batch_entries, 64);

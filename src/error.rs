@@ -137,6 +137,15 @@ pub enum SdJournalError {
         /// Human-readable description of the transient condition.
         reason: String,
     },
+    /// Immutable disposed journal bytes are permanently incomplete or malformed.
+    PermanentDisposed {
+        /// Disposed journal path.
+        path: PathBuf,
+        /// Offset associated with the permanent loss, when known.
+        offset: Option<u64>,
+        /// Human-readable loss detail.
+        reason: String,
+    },
     /// A compressed DATA payload could not be decoded.
     DecompressFailed {
         /// Compression algorithm that was being decoded.
@@ -195,6 +204,22 @@ impl fmt::Display for SdJournalError {
             SdJournalError::Transient { path, reason } => match path {
                 Some(path) => write!(f, "transient journal state at {}: {reason}", path.display()),
                 None => write!(f, "transient journal state: {reason}"),
+            },
+            SdJournalError::PermanentDisposed {
+                path,
+                offset,
+                reason,
+            } => match offset {
+                Some(offset) => write!(
+                    f,
+                    "permanent disposed journal loss at {} (offset {offset}): {reason}",
+                    path.display()
+                ),
+                None => write!(
+                    f,
+                    "permanent disposed journal loss at {}: {reason}",
+                    path.display()
+                ),
             },
             SdJournalError::DecompressFailed { algo, reason } => {
                 write!(f, "decompress failed ({algo}): {reason}")

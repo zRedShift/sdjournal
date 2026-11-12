@@ -56,9 +56,36 @@ struct JournalFileInner {
     used_size: u64,
     file_len: u64,
     modified_at_open: Option<SystemTime>,
+    disposed_recovery: bool,
     #[cfg(unix)]
     file_identity: (u64, u64),
     access: Access,
+}
+
+fn classify_disposed_error(
+    disposed_recovery: bool,
+    path: &Path,
+    offset: Option<u64>,
+    error: SdJournalError,
+) -> SdJournalError {
+    if !disposed_recovery {
+        return error;
+    }
+    match error {
+        SdJournalError::Corrupt { reason, .. }
+        | SdJournalError::Transient { reason, .. }
+        | SdJournalError::Unsupported { reason } => SdJournalError::PermanentDisposed {
+            path: path.to_owned(),
+            offset,
+            reason,
+        },
+        SdJournalError::DecompressFailed { algo, reason } => SdJournalError::PermanentDisposed {
+            path: path.to_owned(),
+            offset,
+            reason: format!("{algo} decompression failed: {reason}"),
+        },
+        error => error,
+    }
 }
 
 #[derive(Clone)]
@@ -113,6 +140,7 @@ impl JournalFile {
                 used_size: boundary.used_size,
                 file_len: self.inner.file_len,
                 modified_at_open: self.inner.modified_at_open,
+                disposed_recovery: self.inner.disposed_recovery,
                 #[cfg(unix)]
                 file_identity: self.inner.file_identity,
                 access: self.inner.access.clone(),
@@ -209,6 +237,7 @@ impl JournalFile {
                 used_size: self.inner.used_size,
                 file_len: self.inner.file_len,
                 modified_at_open: self.inner.modified_at_open,
+                disposed_recovery: self.inner.disposed_recovery,
                 file_identity: self.inner.file_identity,
                 access,
             }),
@@ -228,6 +257,7 @@ impl JournalFile {
                 used_size: self.inner.used_size,
                 file_len: self.inner.file_len,
                 modified_at_open: self.inner.modified_at_open,
+                disposed_recovery: self.inner.disposed_recovery,
                 #[cfg(unix)]
                 file_identity: self.inner.file_identity,
                 access: Access::Reopen(ReopenAccess::new(
@@ -272,6 +302,8 @@ impl JournalFile {
         config: &JournalConfig,
         reopen_each_read: bool,
     ) -> Result<Self> {
+        let disposed_recovery = config.recover_disposed_journal_tails
+            && path.extension().and_then(|extension| extension.to_str()) == Some("journal~");
         let opening_metadata = file
             .metadata()
             .map_err(|e| SdJournalError::io("metadata", Some(path.clone()), e))?;
@@ -280,8 +312,11 @@ impl JournalFile {
 
         let file_access = FileAccess::new(path.clone(), file.clone());
         let header_len = usize::try_from(file_len).unwrap_or(usize::MAX).min(272);
-        let header_buf = file_access.read_known_valid(0, header_len)?;
-        let header = Header::parse(header_buf.as_slice(), &path)?;
+        let header_buf = file_access
+            .read_known_valid(0, header_len)
+            .map_err(|error| classify_disposed_error(disposed_recovery, &path, None, error))?;
+        let header = Header::parse(header_buf.as_slice(), &path)
+            .map_err(|error| classify_disposed_error(disposed_recovery, &path, None, error))?;
         let arena_end = checked_add_u64(
             header.header_size,
             header.arena_size,
@@ -303,7 +338,7 @@ impl JournalFile {
             arena_end,
             "parsed journal header"
         );
-        if arena_end > file_len {
+        if arena_end > file_len && !disposed_recovery {
             return Err(SdJournalError::Transient {
                 path: Some(path.clone()),
                 reason: format!(
@@ -312,13 +347,20 @@ impl JournalFile {
             });
         }
         if header.state > STATE_ARCHIVED {
-            return Err(SdJournalError::Corrupt {
-                path: Some(path.clone()),
-                offset: Some(16),
-                reason: format!("unknown header state: {}", header.state),
-            });
+            return Err(classify_disposed_error(
+                disposed_recovery,
+                &path,
+                Some(16),
+                SdJournalError::Corrupt {
+                    path: Some(path.clone()),
+                    offset: Some(16),
+                    reason: format!("unknown header state: {}", header.state),
+                },
+            ));
         }
-        let used_size = if header.tail_object_offset == 0 {
+        let used_size = if disposed_recovery {
+            arena_end.min(file_len)
+        } else if header.tail_object_offset == 0 {
             header.header_size
         } else {
             let tail_offset = header.tail_object_offset;
@@ -365,14 +407,15 @@ impl JournalFile {
         } else {
             #[cfg(feature = "mmap")]
             {
-                let use_mmap = match config.mmap_policy {
-                    MmapPolicy::Never => false,
-                    MmapPolicy::Auto => match header.state {
-                        STATE_ONLINE => config.allow_mmap_online,
-                        STATE_OFFLINE | STATE_ARCHIVED => true,
-                        _ => false,
-                    },
-                };
+                let use_mmap = !disposed_recovery
+                    && match config.mmap_policy {
+                        MmapPolicy::Never => false,
+                        MmapPolicy::Auto => match header.state {
+                            STATE_ONLINE => config.allow_mmap_online,
+                            STATE_OFFLINE | STATE_ARCHIVED => true,
+                            _ => false,
+                        },
+                    };
 
                 if use_mmap {
                     // SAFETY: Mapping a file is inherently `unsafe` because the file may change on disk.
@@ -402,6 +445,7 @@ impl JournalFile {
                 used_size,
                 file_len,
                 modified_at_open,
+                disposed_recovery,
                 #[cfg(unix)]
                 file_identity: (opening_metadata.dev(), opening_metadata.ino()),
                 access,
@@ -411,6 +455,23 @@ impl JournalFile {
 
     pub(crate) fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    pub(crate) fn disposed_recovery(&self) -> bool {
+        self.inner.disposed_recovery
+    }
+
+    pub(crate) fn classify_disposed_error(
+        &self,
+        offset: Option<u64>,
+        error: SdJournalError,
+    ) -> SdJournalError {
+        classify_disposed_error(
+            self.inner.disposed_recovery,
+            &self.inner.path,
+            offset,
+            error,
+        )
     }
 
     pub(crate) fn file_id(&self) -> [u8; 16] {
@@ -604,11 +665,17 @@ impl JournalFile {
     pub(crate) fn read_bytes(&self, offset: u64, len: usize) -> Result<ByteBuf> {
         let end = checked_add_u64(offset, u64::try_from(len).unwrap_or(u64::MAX), "read range")?;
         if end > self.inner.used_size {
-            return Err(SdJournalError::Corrupt {
+            let error = SdJournalError::Corrupt {
                 path: Some(self.inner.path.clone()),
                 offset: Some(offset),
                 reason: "read out of bounds".to_string(),
-            });
+            };
+            return Err(classify_disposed_error(
+                self.inner.disposed_recovery,
+                &self.inner.path,
+                Some(offset),
+                error,
+            ));
         }
 
         match &self.inner.access {
@@ -660,6 +727,13 @@ impl JournalFile {
         reason: impl Into<String>,
     ) -> SdJournalError {
         let reason = reason.into();
+        if self.inner.disposed_recovery {
+            return SdJournalError::PermanentDisposed {
+                path: self.inner.path.clone(),
+                offset,
+                reason,
+            };
+        }
         if self.inner.header.state == crate::format::STATE_ONLINE {
             SdJournalError::Transient {
                 path: Some(self.inner.path.clone()),

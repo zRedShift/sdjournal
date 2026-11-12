@@ -750,7 +750,7 @@ fn is_machine_id_dir(name: &OsStr) -> bool {
 fn is_journal_file(path: &Path, config: &JournalConfig) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some("journal") => true,
-        Some("journal~") => config.include_journal_tilde,
+        Some("journal~") => config.include_journal_tilde || config.recover_disposed_journal_tails,
         _ => false,
     }
 }
