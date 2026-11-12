@@ -928,6 +928,39 @@ mod tests {
     }
 
     #[test]
+    fn disposed_lazy_cache_never_maps_under_auto_while_ordinary_archived_files_still_can() {
+        for state in [
+            crate::format::STATE_OFFLINE,
+            crate::format::STATE_ONLINE,
+            crate::format::STATE_ARCHIVED,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let disposed = root.path().join(format!("state-{state}.journal~"));
+            fixture::write_synthetic_journal_file(&disposed, &["a.service"], state + 1);
+            patch(&disposed, 16, &[state]);
+            let cache = ReaderCache::new(&JournalConfig {
+                recover_disposed_journal_tails: true,
+                max_open_files: 1,
+                ..Default::default()
+            });
+            open(&cache, &disposed).read_bytes(0, 88).unwrap();
+            assert!(
+                matches!(cache.entries.lock().unwrap()[0].access, Access::File(_)),
+                "disposed state {state} must retain descriptor I/O"
+            );
+        }
+
+        let (_root, paths) = files(1);
+        let cache = ReaderCache::new(&JournalConfig::default());
+        open(&cache, &paths[0]).read_bytes(0, 88).unwrap();
+        #[cfg(feature = "mmap")]
+        assert!(matches!(
+            cache.entries.lock().unwrap()[0].access,
+            Access::Mmap(_)
+        ));
+    }
+
+    #[test]
     fn cached_snapshots_do_not_expand_with_newer_shared_extent() {
         let (_root, paths) = files(1);
         let cache = ReaderCache::new(&JournalConfig::default());

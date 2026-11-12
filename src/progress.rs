@@ -1001,6 +1001,63 @@ mod tests {
                 .any(|item| matches!(item, ScanItem::FileTerminated { .. }))
         );
     }
+
+    #[test]
+    fn disposed_first_result_and_positioned_resume_do_not_prescan_history() {
+        let fixture = fixture::SyntheticJournalFile::new(&vec!["same"; 512]);
+        let source = fixture.root().join("synthetic.journal");
+        std::fs::rename(source, fixture.root().join("previous.journal~")).unwrap();
+        let journal = Journal::open_progress_dirs(
+            &[fixture.root().to_owned()],
+            JournalConfig {
+                recover_disposed_journal_tails: true,
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        test_io::reset();
+        let mut first_scan = journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap();
+        let setup_reads = test_io::reads();
+        let first = first_scan.next().unwrap().unwrap();
+        let first_result_reads = test_io::reads();
+        assert!(matches!(first, ScanItem::Entry { .. }));
+        assert!(
+            setup_reads <= 12,
+            "disposed setup reread {setup_reads} historical slots"
+        );
+        assert!(
+            first_result_reads <= 24,
+            "disposed first result needed {first_result_reads} reads"
+        );
+
+        let mut positions = Vec::new();
+        for item in journal
+            .scan_from_positions(&[], ScanOptions::default())
+            .unwrap()
+        {
+            if let ScanItem::Entry { position, .. } = item.unwrap() {
+                positions.push(position);
+            }
+        }
+        test_io::reset();
+        let mut resumed = journal
+            .scan_from_positions(&positions[510..511], ScanOptions::default())
+            .unwrap();
+        let resume_setup_reads = test_io::reads();
+        assert!(matches!(
+            resumed.next().unwrap().unwrap(),
+            ScanItem::Entry { .. }
+        ));
+        assert!(
+            resume_setup_reads <= 16,
+            "disposed resume reread acknowledged history in {resume_setup_reads} reads"
+        );
+    }
 }
 
 #[cfg(test)]

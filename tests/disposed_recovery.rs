@@ -18,6 +18,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn tear_inside_last_entry(path: &Path) {
     let bytes = fs::read(path).unwrap();
     let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
@@ -52,6 +56,7 @@ struct Summary {
     positions: Vec<FilePosition>,
     terminated: Vec<(u64, String)>,
     permanent_omissions: usize,
+    stopped: Vec<String>,
 }
 
 fn scan(journal: &Journal, positions: &[FilePosition]) -> Summary {
@@ -80,7 +85,7 @@ fn scan(journal: &Journal, positions: &[FilePosition]) -> Summary {
                 error,
                 ..
             } => summary.terminated.push((last_ordinal, error.to_string())),
-            ScanItem::FileStopped { error, .. } => panic!("unexpected retryable stop: {error}"),
+            ScanItem::FileStopped { error, .. } => summary.stopped.push(error.to_string()),
             ScanItem::Replayed { .. } => {}
         }
     }
@@ -204,6 +209,143 @@ fn disposed_non_tail_entry_corruption_is_reported_while_later_slots_continue() {
         ]
     );
     assert_eq!(summary.permanent_omissions, 1);
+}
+
+#[test]
+fn disposed_bad_slot_target_does_not_hide_a_later_valid_entry() {
+    let fixture = SyntheticJournalFile::new(&["one.service", "two.service", "three.service"]);
+    let source = fixture.root().join("synthetic.journal");
+    let target = fixture.root().join("bad-slot.journal~");
+    fs::rename(source, &target).unwrap();
+    let mut bytes = fs::read(&target).unwrap();
+    let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
+    let first_data = read_u64(&bytes, 272);
+    write_u64(&mut bytes, array + 24 + 8, first_data);
+    fs::write(&target, bytes).unwrap();
+    let journal =
+        Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[]).unwrap();
+    let summary = scan(&journal, &[]);
+    assert_eq!(
+        summary.messages,
+        [
+            synthetic_message(7, 0, "one.service"),
+            synthetic_message(7, 2, "three.service")
+        ]
+    );
+    assert_eq!(summary.permanent_omissions, 1);
+    assert!(summary.terminated.is_empty());
+}
+
+#[test]
+fn disposed_prefix_survives_broken_array_topology() {
+    for topology in ["short", "nonforward", "malformed-next"] {
+        let fixture = SyntheticJournalFile::new(&["one.service", "two.service", "three.service"]);
+        let source = fixture.root().join("synthetic.journal");
+        let target = fixture.root().join(format!("{topology}.journal~"));
+        fs::rename(source, &target).unwrap();
+        let mut bytes = fs::read(&target).unwrap();
+        bytes[16] = 2;
+        let array = usize::try_from(read_u64(&bytes, 176)).unwrap();
+        let first_data = read_u64(&bytes, 272);
+        write_u64(&mut bytes, array + 8, 24 + 3 * 8);
+        write_u64(&mut bytes, 152, 4);
+        match topology {
+            "short" => {}
+            "nonforward" => write_u64(&mut bytes, array + 16, array as u64),
+            "malformed-next" => write_u64(&mut bytes, array + 16, first_data),
+            _ => unreachable!(),
+        }
+        fs::write(&target, bytes).unwrap();
+        let journal =
+            Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[])
+                .unwrap();
+        let summary = scan(&journal, &[]);
+        assert_eq!(
+            summary.messages.len(),
+            3,
+            "{topology} must publish the validated prefix before its terminal notice"
+        );
+        assert_eq!(summary.terminated.len(), 1, "{topology}");
+        assert_eq!(summary.terminated[0].0, 3, "{topology}");
+    }
+}
+
+#[test]
+fn disposed_unused_array_capacity_cut_is_not_reported_as_record_loss() {
+    let fixture = SyntheticJournalFile::new(&["one.service", "two.service"]);
+    let source = fixture.root().join("synthetic.journal");
+    let target = fixture.root().join("unused-capacity.journal~");
+    fs::rename(source, &target).unwrap();
+    let mut bytes = fs::read(&target).unwrap();
+    let old_array = usize::try_from(read_u64(&bytes, 176)).unwrap();
+    let offsets = [
+        read_u64(&bytes, old_array + 24),
+        read_u64(&bytes, old_array + 32),
+    ];
+    let new_array = bytes.len().next_multiple_of(8);
+    bytes.resize(new_array + 24 + offsets.len() * 8, 0);
+    bytes[new_array] = 6;
+    write_u64(&mut bytes, new_array + 8, 24 + 64 * 8);
+    for (index, offset) in offsets.into_iter().enumerate() {
+        write_u64(&mut bytes, new_array + 24 + index * 8, offset);
+    }
+    let new_len = bytes.len();
+    write_u64(&mut bytes, 96, (new_len - 272) as u64);
+    write_u64(&mut bytes, 136, new_array as u64);
+    write_u64(&mut bytes, 176, new_array as u64);
+    fs::write(&target, bytes).unwrap();
+    let journal =
+        Journal::open_progress_dirs(&[fixture.root().to_owned()], recovery_config(), &[]).unwrap();
+    let summary = scan(&journal, &[]);
+    assert_eq!(summary.messages.len(), 2);
+    assert!(summary.terminated.is_empty());
+    assert_eq!(summary.permanent_omissions, 0);
+}
+
+#[test]
+fn post_open_truncation_stays_retryable_for_eager_and_lazy_recovery() {
+    for max_open_files in [1, 64] {
+        let root = tempfile::tempdir().unwrap();
+        for seed in 1..=2 {
+            fixture::write_synthetic_journal_file(
+                &root.path().join(format!("{seed}.journal~")),
+                &["one.service", "two.service"],
+                seed,
+            );
+        }
+        let journal = Journal::open_progress_dirs(
+            &[root.path().to_owned()],
+            JournalConfig {
+                recover_disposed_journal_tails: true,
+                mmap_policy: MmapPolicy::Never,
+                max_open_files,
+                ..JournalConfig::default()
+            },
+            &[],
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join("1.journal~"))
+            .unwrap()
+            .set_len(272)
+            .unwrap();
+        let summary = scan(&journal, &[]);
+        assert_eq!(summary.stopped.len(), 1, "max_open_files={max_open_files}");
+        assert!(
+            summary.stopped[0].contains("truncated"),
+            "max_open_files={max_open_files}: {:?}",
+            summary.stopped
+        );
+        assert!(
+            summary.terminated.is_empty(),
+            "max_open_files={max_open_files}"
+        );
+        assert!(
+            !summary.messages.is_empty(),
+            "healthy peer must remain readable"
+        );
+    }
 }
 
 #[test]
